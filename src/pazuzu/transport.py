@@ -9,6 +9,7 @@ import shlex
 import signal
 import subprocess
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,64 @@ def _spawn_master(argv: list[str], log_handle: Any) -> subprocess.Popen[bytes]:
         stderr=log_handle,
         start_new_session=True,
     )
+
+
+@dataclass(frozen=True)
+class ShellAttachment:
+    """Snapshot describing one fail-closed interactive SSH attachment."""
+
+    host: str
+    ssh_binary: str
+    control_path: Path
+    generation: int
+
+    def __post_init__(self) -> None:
+        if not self.host or "\x00" in self.host:
+            raise ValueError("attachment host must be non-empty and contain no NUL bytes")
+        if not self.ssh_binary or "\x00" in self.ssh_binary:
+            raise ValueError("attachment SSH executable must be non-empty and contain no NUL bytes")
+        if not str(self.control_path) or "\x00" in str(self.control_path):
+            raise ValueError("attachment control path must be non-empty and contain no NUL bytes")
+        if (
+            isinstance(self.generation, bool)
+            or not isinstance(self.generation, int)
+            or self.generation < 1
+        ):
+            raise ValueError("attachment generation must be a positive integer")
+
+    def as_dict(self) -> dict[str, str | int]:
+        """Return the narrow JSON representation exposed by the gateway."""
+
+        return {
+            "host": self.host,
+            "ssh_binary": self.ssh_binary,
+            "control_path": str(self.control_path),
+            "generation": self.generation,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> ShellAttachment:
+        """Parse a gateway response without accepting extra SSH configuration."""
+
+        expected = {"host", "ssh_binary", "control_path", "generation"}
+        if set(value) != expected:
+            raise ValueError("invalid shell attachment descriptor fields")
+        host = value["host"]
+        ssh_binary = value["ssh_binary"]
+        control_path = value["control_path"]
+        generation = value["generation"]
+        if not all(isinstance(item, str) for item in (host, ssh_binary, control_path)):
+            raise TypeError("shell attachment paths and host must be strings")
+        if not control_path:
+            raise ValueError("shell attachment control path must not be empty")
+        if isinstance(generation, bool) or not isinstance(generation, int):
+            raise TypeError("shell attachment generation must be an integer")
+        return cls(
+            host=host,
+            ssh_binary=ssh_binary,
+            control_path=Path(control_path),
+            generation=generation,
+        )
 
 
 @dataclass(frozen=True)
@@ -404,6 +463,7 @@ def run_bridge(
 
 __all__ = [
     "OpenSshTransport",
+    "ShellAttachment",
     "SshSettings",
     "bridge_control_argv",
     "bridge_session_argv",

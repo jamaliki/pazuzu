@@ -69,6 +69,22 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(32, len(large.stdout))
         self.assertTrue(large.stdout_truncated)
 
+    async def test_shell_attachment_repairs_and_reports_the_current_generation(self) -> None:
+        supervisor = self.supervisor()
+        try:
+            first = await supervisor.shell_attachment()
+            os.kill(int(self.read_state()["master_pid"]), signal.SIGKILL)
+            second = await supervisor.shell_attachment()
+        finally:
+            await supervisor.close()
+
+        self.assertEqual("test-host", first.host)
+        self.assertEqual(self.fake_ssh, Path(first.ssh_binary))
+        self.assertEqual(self.root / "ssh.ctl", first.control_path)
+        self.assertEqual(1, first.generation)
+        self.assertEqual(2, second.generation)
+        self.assertEqual(2, self.read_state()["master_starts"])
+
     async def test_safe_command_repairs_and_replays_once(self) -> None:
         supervisor = self.supervisor()
         try:

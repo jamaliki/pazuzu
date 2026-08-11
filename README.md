@@ -66,6 +66,29 @@ pazuzu exec -- 'squeue -u "$USER"'
 python3 inspect.py | pazuzu exec -- python3 -
 ```
 
+### Interactive shell
+
+Attach a real terminal to a persistent remote `tmux` session through the same
+gateway-owned SSH connection:
+
+```bash
+pazuzu shell
+pazuzu shell --session analysis
+```
+
+The remote host must have `tmux` installed. The default session is `pazuzu`;
+named sessions let you keep independent shells. Run `exit` to end the remote
+shell, or press `Ctrl-b d` to detach while leaving it available for a later
+`pazuzu shell` invocation.
+
+If SSH disconnects, Pazuzu leaves the remote `tmux` session and its foreground
+command alone, repairs the gateway connection, and reattaches. Terminal input
+is never buffered or replayed. If the gateway reports that SSH authorization is
+required, complete the configured provider login in another terminal and run
+`pazuzu reconnect`; the waiting shell reattaches automatically. Press `Ctrl-C`
+while it is waiting to stop locally. Keep interactive work light on shared login
+hosts and submit computation through the site's scheduler.
+
 Pazuzu keeps its socket available when the network or authentication is down.
 OpenSSH probes the encrypted connection every 15 seconds, Pazuzu opens a real
 session once a minute, and a failed connection is retried with bounded backoff

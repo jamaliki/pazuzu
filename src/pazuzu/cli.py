@@ -25,8 +25,9 @@ from .launchd import (
     service_status,
     uninstall_services,
 )
+from .shell import require_interactive_terminal, run_shell
 from .ssh import OpenSshSupervisor, SshSettings
-from .transport import run_bridge
+from .transport import ShellAttachment, run_bridge
 
 
 def _path(value: str) -> Path:
@@ -83,6 +84,12 @@ def _parser() -> argparse.ArgumentParser:
     bridge.add_argument("--remote-host", default="127.0.0.1")
     bridge.add_argument("--remote-port", type=int, required=True)
     bridge.add_argument("remote_command", nargs=argparse.REMAINDER)
+
+    shell = subparsers.add_parser(
+        "shell", help="attach an interactive terminal to a persistent remote tmux session"
+    )
+    shell.add_argument("--socket", type=_path, default=_socket_default())
+    shell.add_argument("--session", default="pazuzu")
 
     service = subparsers.add_parser("service", help="manage auto-restarting macOS services")
     service_commands = service.add_subparsers(dest="service_operation", required=True)
@@ -204,6 +211,26 @@ async def _run(arguments: argparse.Namespace) -> int:
         if result.get("stdout_truncated") or result.get("stderr_truncated"):
             print("pazuzu: remote output was truncated", file=sys.stderr)
         return int(result["exit_code"])
+    if arguments.operation == "shell":
+        require_interactive_terminal()
+
+        async def get_attachment() -> ShellAttachment:
+            result = await call_gateway(arguments.socket, "shell_attachment", timeout=140.0)
+            return ShellAttachment.from_dict(result)
+
+        async def reconnect() -> dict[str, object]:
+            return await call_gateway(arguments.socket, "reconnect", timeout=140.0)
+
+        async def status() -> dict[str, object]:
+            return await call_gateway(arguments.socket, "status")
+
+        return await run_shell(
+            arguments.session,
+            get_attachment=get_attachment,
+            reconnect=reconnect,
+            status=status,
+            stderr=sys.stderr,
+        )
     raise AssertionError("unreachable operation")
 
 

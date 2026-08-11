@@ -229,6 +229,10 @@ class GatewayServer:
         if operation == "shutdown":
             asyncio.get_running_loop().call_soon(self.request_stop)
             return {"stopping": True}
+        if operation == "shell_attachment":
+            if params:
+                raise ProtocolError("shell_attachment params must be empty")
+            return (await self.supervisor.shell_attachment()).as_dict()
         if operation == "execute":
             return await self._execute(params)
         raise ProtocolError(f"unknown gateway operation {operation!r}")

@@ -11,7 +11,7 @@ from typing import Any
 
 from .errors import ConnectionUnavailable, UncertainExecution
 from .process import ProcessResult
-from .transport import OpenSshTransport, SshSettings
+from .transport import OpenSshTransport, ShellAttachment, SshSettings
 
 AUTH_MARKERS = (
     "authentication failed",
@@ -136,6 +136,17 @@ class OpenSshSupervisor:
         finally:
             self._wake.set()
         return await self.health(probe=False)
+
+    async def shell_attachment(self) -> ShellAttachment:
+        """Return a snapshot of the current master for an interactive client."""
+
+        generation = await self._ensure_connected()
+        return ShellAttachment(
+            host=self.settings.host,
+            ssh_binary=self.settings.ssh_binary,
+            control_path=self.settings.control_path,
+            generation=generation,
+        )
 
     async def health(self, *, probe: bool = False) -> dict[str, Any]:
         """Return bounded local and remote connection state."""

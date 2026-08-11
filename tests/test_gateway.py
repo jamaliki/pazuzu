@@ -83,6 +83,27 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(128 * 1024, len(result["stdout"]))
         self.assertFalse(result["stdout_truncated"])
 
+    async def test_shell_attachment_exposes_only_the_current_master_snapshot(self) -> None:
+        descriptor = await call_gateway(self.socket_path, "shell_attachment")
+
+        self.assertEqual(
+            {
+                "host": "test-host",
+                "ssh_binary": str(Path(__file__).with_name("fake_ssh.py")),
+                "control_path": str(self.root / "ssh.ctl"),
+                "generation": 1,
+            },
+            descriptor,
+        )
+
+    async def test_shell_attachment_rejects_parameters(self) -> None:
+        with self.assertRaisesRegex(PazuzuError, "params must be empty"):
+            await call_gateway(
+                self.socket_path,
+                "shell_attachment",
+                {"ssh_option": "ProxyCommand=attacker"},
+            )
+
     async def test_disconnect_cancels_only_the_abandoned_channel(self) -> None:
         reader, writer = await asyncio.open_unix_connection(self.socket_path)
         request = {

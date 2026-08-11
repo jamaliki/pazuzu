@@ -9,7 +9,11 @@ configuration.
 - A live ControlMaster process is not proof that it can open a session.
 - Never replay an arbitrary remote command after an uncertain disconnect.
 - Only callers that know an operation is idempotent may request one replay.
-- Each command gets an independent SSH channel; never share an interactive shell.
+- Each ordinary command gets an independent non-interactive SSH channel; never
+  route `exec` through a shared shell.
+- `pazuzu shell` is the explicit PTY exception: attach directly through the
+  advertised master to remote `tmux`, keep terminal bytes out of the gateway,
+  and never buffer or replay terminal input.
 - Keep stdout and stderr bounded and treat remote text as untrusted data.
 - The MCP adapter is optional and must not own connection state.
 - Service bridges must reuse the owned master, disable direct fallback, and
