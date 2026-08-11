@@ -57,9 +57,8 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("127.0.0.1:8766:127.0.0.1:18766", control)
         self.assertEqual("forward", control[control.index("-O") + 1])
         self.assertEqual("example-host", session[-2])
-        self.assertEqual(
-            "exec /remote/bin/server --name 'value with spaces'", session[-1]
-        )
+        self.assertIn("exec sh -c", session[-1])
+        self.assertIn("pazuzu-bridge /remote/bin/server --name 'value with spaces'", session[-1])
 
     @mock.patch("pazuzu.transport.signal.signal")
     @mock.patch("pazuzu.transport.subprocess.Popen")
@@ -81,6 +80,7 @@ class BridgeTests(unittest.TestCase):
 
         self.assertEqual(17, result)
         self.assertEqual(3, run.call_count)
+        self.assertEqual(mock.call(mock.ANY, stdin=-1), popen.call_args)
         operations = [call.args[0][call.args[0].index("-O") + 1] for call in run.call_args_list]
         self.assertEqual(["cancel", "forward", "cancel"], operations)
 

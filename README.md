@@ -197,7 +197,8 @@ pazuzu service remove-bridge queue
 
 The local and remote listeners default to `127.0.0.1`. Remote service output is
 written to Pazuzu's normal bridge logs. The listener is removed whenever the
-remote command exits, including after a clean stop. When SSH disconnects, both
-channels end and launchd retries until the gateway reconnects. A bridge is
-generic transport and does not know or cache the remote protocol, tools,
-headers, or application version.
+remote command exits, including after a clean stop. A private stdin lease also
+stops the remote process when the bridge or SSH transport disappears. When SSH
+disconnects, both channels end and launchd retries until the gateway reconnects.
+A bridge is generic transport and does not know or cache the remote protocol,
+tools, headers, or application version.
