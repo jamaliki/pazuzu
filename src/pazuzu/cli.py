@@ -98,7 +98,7 @@ def _parser() -> argparse.ArgumentParser:
     install_bridge_command.add_argument("--listen-port", type=int, required=True)
     install_bridge_command.add_argument("--remote-host", default="127.0.0.1")
     install_bridge_command.add_argument("--remote-port", type=int, required=True)
-    install_bridge_command.add_argument("remote_command", nargs=argparse.REMAINDER)
+    install_bridge_command.add_argument("remote_command", nargs="+")
     remove_bridge_command = service_commands.add_parser("remove-bridge")
     remove_bridge_command.add_argument("name")
     service_commands.add_parser("status")

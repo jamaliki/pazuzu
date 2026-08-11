@@ -5,10 +5,31 @@ from pathlib import Path
 from unittest import mock
 
 from pazuzu import launchd
+from pazuzu.cli import _parser
 from pazuzu.transport import SshSettings, bridge_argv
 
 
 class BridgeTests(unittest.TestCase):
+    def test_install_parser_accepts_options_after_the_bridge_name(self) -> None:
+        arguments = _parser().parse_args(
+            [
+                "service",
+                "install-bridge",
+                "queue",
+                "--listen-port",
+                "8766",
+                "--remote-port",
+                "18766",
+                "--",
+                "/remote/bin/server",
+                "--flag",
+            ]
+        )
+
+        self.assertEqual("queue", arguments.name)
+        self.assertEqual(8766, arguments.listen_port)
+        self.assertEqual(["/remote/bin/server", "--flag"], arguments.remote_command)
+
     def test_bridge_reuses_the_master_without_direct_fallback(self) -> None:
         arguments = bridge_argv(
             SshSettings(host="example-host", control_path=Path("/tmp/pazuzu.ctl")),
