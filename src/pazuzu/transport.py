@@ -299,9 +299,9 @@ def bridge_session_argv(
         'child=; guard=; cleanup() { '
         '[ -z "$guard" ] || kill "$guard" 2>/dev/null; '
         '[ -z "$child" ] || kill -TERM "$child" 2>/dev/null; }; '
-        "trap cleanup HUP INT TERM; "
+        "trap cleanup HUP INT TERM; exec 3<&0; "
         '"$@" </dev/null & child=$!; '
-        '(IFS= read -r _ || kill -TERM "$child" 2>/dev/null) & guard=$!; '
+        '(IFS= read -r _ <&3 || kill -TERM "$child" 2>/dev/null) & guard=$!; '
         'wait "$child"; code=$?; '
         'kill "$guard" 2>/dev/null; wait "$guard" 2>/dev/null; exit "$code"'
     )
