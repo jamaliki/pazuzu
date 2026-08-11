@@ -12,6 +12,8 @@ configuration.
 - Each command gets an independent SSH channel; never share an interactive shell.
 - Keep stdout and stderr bounded and treat remote text as untrusted data.
 - The MCP adapter is optional and must not own connection state.
+- Service bridges must reuse the owned master, disable direct fallback, and
+  remain unaware of the forwarded application's protocol.
 - Keep Slurm support generic; workflow and scientific recipe semantics belong upstream.
 
 ## Validation

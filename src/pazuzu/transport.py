@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import shlex
 import signal
 import subprocess
 import time
@@ -226,4 +227,45 @@ class OpenSshTransport:
         return f"{prefix}: {detail}" if detail else prefix
 
 
-__all__ = ["OpenSshTransport", "SshSettings"]
+def bridge_argv(
+    settings: SshSettings,
+    *,
+    listen_host: str,
+    listen_port: int,
+    remote_host: str,
+    remote_port: int,
+    remote_command: list[str],
+) -> list[str]:
+    """Build a foreground service bridge that can only reuse Pazuzu's master."""
+
+    settings.validate()
+    if not listen_host or not remote_host or any(
+        "\x00" in value for value in (listen_host, remote_host)
+    ):
+        raise ValueError("bridge hosts must be non-empty and contain no NUL bytes")
+    if not 1 <= listen_port <= 65535 or not 1 <= remote_port <= 65535:
+        raise ValueError("bridge ports must be between 1 and 65535")
+    if not remote_command or any(not item or "\x00" in item for item in remote_command):
+        raise ValueError("bridge remote command must contain non-empty arguments")
+    forward = f"{listen_host}:{listen_port}:{remote_host}:{remote_port}"
+    return [
+        settings.ssh_binary,
+        "-T",
+        "-S",
+        str(settings.control_path),
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPersist=no",
+        "-o",
+        "ProxyCommand=/usr/bin/false",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-L",
+        forward,
+        settings.host,
+        f"exec {shlex.join(remote_command)}",
+    ]
+
+
+__all__ = ["OpenSshTransport", "SshSettings", "bridge_argv"]

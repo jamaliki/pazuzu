@@ -165,3 +165,38 @@ application names, remote paths, project policy, or provider-specific recovery.
 
 Pazuzu never stores the remote command, standard input, or output after the
 request completes.
+
+## Managed service bridges
+
+Use a bridge when a lightweight remote HTTP service should remain available on
+a local loopback port without installing that service locally. The bridge opens
+one channel through Pazuzu's existing ControlMaster, forwards the port, and runs
+the remote command in that same channel:
+
+```bash
+pazuzu bridge \
+  --host example-host \
+  --listen-port 8766 \
+  --remote-port 18766 \
+  -- /remote/bin/service --host 127.0.0.1 --port 18766
+```
+
+It cannot create a direct SSH connection: if Pazuzu's master is unavailable,
+the bridge exits. For an auto-restarting bridge, install the gateway first and
+then install a named LaunchAgent:
+
+```bash
+pazuzu service install-bridge queue \
+  --listen-port 8766 \
+  --remote-port 18766 \
+  -- /remote/bin/service --host 127.0.0.1 --port 18766
+
+pazuzu service status
+pazuzu service remove-bridge queue
+```
+
+The local and remote listeners default to `127.0.0.1`. Remote service output is
+written to Pazuzu's normal bridge logs. When SSH disconnects, the channel and
+remote command end together; launchd retries until the gateway reconnects. A
+bridge is generic transport and does not know or cache the remote protocol,
+tools, headers, or application version.

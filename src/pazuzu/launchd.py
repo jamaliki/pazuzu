@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import os
 import plistlib
+import re
 import subprocess
 import sys
 import time
@@ -14,6 +15,8 @@ from .gateway import default_control_path, default_socket_path, default_state_di
 
 GATEWAY_LABEL = "science.jamali.pazuzu.gateway"
 MCP_LABEL = "science.jamali.pazuzu.mcp"
+BRIDGE_LABEL_PREFIX = "science.jamali.pazuzu.bridge."
+BRIDGE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
 
 
 def _domain() -> str:
@@ -22,6 +25,12 @@ def _domain() -> str:
 
 def _agent_path(label: str) -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+
+
+def _bridge_label(name: str) -> str:
+    if not BRIDGE_NAME.fullmatch(name):
+        raise ValueError("bridge name must be 1-32 lowercase letters, digits, or hyphens")
+    return f"{BRIDGE_LABEL_PREFIX}{name}"
 
 
 def _executable(name: str) -> Path:
@@ -176,12 +185,68 @@ def install_services(host: str, *, mcp_port: int | None = None) -> list[Path]:
     return installed
 
 
+def install_bridge(
+    name: str,
+    remote_command: list[str],
+    *,
+    listen_host: str,
+    listen_port: int,
+    remote_host: str,
+    remote_port: int,
+) -> Path:
+    """Install a generic service and port-forward channel over Pazuzu's master."""
+
+    host = _configured_host()
+    if not host:
+        raise RuntimeError("install the Pazuzu gateway before installing a bridge")
+    if not remote_command:
+        raise ValueError("remote command must not be empty")
+    label = _bridge_label(name)
+    arguments = [
+        str(_executable("pazuzu")),
+        "bridge",
+        "--host",
+        host,
+        "--control-path",
+        str(default_control_path()),
+        "--listen-host",
+        listen_host,
+        "--listen-port",
+        str(listen_port),
+        "--remote-host",
+        remote_host,
+        "--remote-port",
+        str(remote_port),
+        "--",
+        *remote_command,
+    ]
+    return _install(label, _plist(label, arguments, f"bridge-{name}"))
+
+
+def remove_bridge(name: str) -> Path | None:
+    """Unload and remove one named bridge."""
+
+    label = _bridge_label(name)
+    target = _agent_path(label)
+    _launchctl("bootout", f"{_domain()}/{label}", check=False)
+    _wait_until_unloaded(label)
+    if not target.exists():
+        return None
+    target.unlink()
+    return target
+
+
+def _bridge_labels() -> list[str]:
+    directory = Path.home() / "Library" / "LaunchAgents"
+    return [target.stem for target in sorted(directory.glob(f"{BRIDGE_LABEL_PREFIX}*.plist"))]
+
+
 def uninstall_services() -> list[Path]:
     """Unload and remove Pazuzu's LaunchAgents, leaving no daemon running."""
 
     host = _configured_host()
     removed: list[Path] = []
-    for label in (MCP_LABEL, GATEWAY_LABEL):
+    for label in (*_bridge_labels(), MCP_LABEL, GATEWAY_LABEL):
         target = _agent_path(label)
         _launchctl("bootout", f"{_domain()}/{label}", check=False)
         _wait_until_unloaded(label)
@@ -196,9 +261,15 @@ def service_status() -> dict[str, str]:
     """Return launchd's compact state for both optional services."""
 
     statuses: dict[str, str] = {}
-    for label in (GATEWAY_LABEL, MCP_LABEL):
+    for label in (GATEWAY_LABEL, MCP_LABEL, *_bridge_labels()):
         statuses[label] = "loaded" if _loaded(label) else "not_loaded"
     return statuses
 
 
-__all__ = ["install_services", "service_status", "uninstall_services"]
+__all__ = [
+    "install_bridge",
+    "install_services",
+    "remove_bridge",
+    "service_status",
+    "uninstall_services",
+]

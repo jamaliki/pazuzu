@@ -18,8 +18,15 @@ from .gateway import (
     default_socket_path,
     execute_via_gateway,
 )
-from .launchd import install_services, service_status, uninstall_services
+from .launchd import (
+    install_bridge,
+    install_services,
+    remove_bridge,
+    service_status,
+    uninstall_services,
+)
 from .ssh import OpenSshSupervisor, SshSettings
+from .transport import bridge_argv
 
 
 def _path(value: str) -> Path:
@@ -65,12 +72,35 @@ def _parser() -> argparse.ArgumentParser:
     )
     execute.add_argument("command", nargs=argparse.REMAINDER)
 
+    bridge = subparsers.add_parser(
+        "bridge", help="forward one loopback port and run its remote service"
+    )
+    bridge.add_argument("--host", default=os.environ.get("PAZUZU_HOST"), required=False)
+    bridge.add_argument("--control-path", type=_path, default=_control_default())
+    bridge.add_argument("--ssh", default=os.environ.get("PAZUZU_SSH", "/usr/bin/ssh"))
+    bridge.add_argument("--listen-host", default="127.0.0.1")
+    bridge.add_argument("--listen-port", type=int, required=True)
+    bridge.add_argument("--remote-host", default="127.0.0.1")
+    bridge.add_argument("--remote-port", type=int, required=True)
+    bridge.add_argument("remote_command", nargs=argparse.REMAINDER)
+
     service = subparsers.add_parser("service", help="manage auto-restarting macOS services")
     service_commands = service.add_subparsers(dest="service_operation", required=True)
     install = service_commands.add_parser("install")
     install.add_argument("--host", default=os.environ.get("PAZUZU_HOST"), required=False)
     install.add_argument("--with-mcp", action="store_true")
     install.add_argument("--mcp-port", type=int, default=8767)
+    install_bridge_command = service_commands.add_parser(
+        "install-bridge", help="install an auto-restarting generic service bridge"
+    )
+    install_bridge_command.add_argument("name")
+    install_bridge_command.add_argument("--listen-host", default="127.0.0.1")
+    install_bridge_command.add_argument("--listen-port", type=int, required=True)
+    install_bridge_command.add_argument("--remote-host", default="127.0.0.1")
+    install_bridge_command.add_argument("--remote-port", type=int, required=True)
+    install_bridge_command.add_argument("remote_command", nargs=argparse.REMAINDER)
+    remove_bridge_command = service_commands.add_parser("remove-bridge")
+    remove_bridge_command.add_argument("name")
     service_commands.add_parser("status")
     service_commands.add_parser("uninstall")
     return parser
@@ -123,6 +153,21 @@ async def _run(arguments: argparse.Namespace) -> int:
             )
             print(json.dumps({"installed": [str(item) for item in installed]}, indent=2))
             return 0
+        if arguments.service_operation == "install-bridge":
+            target = install_bridge(
+                arguments.name,
+                _bridge_command(arguments.remote_command),
+                listen_host=arguments.listen_host,
+                listen_port=arguments.listen_port,
+                remote_host=arguments.remote_host,
+                remote_port=arguments.remote_port,
+            )
+            print(json.dumps({"installed": str(target)}, indent=2))
+            return 0
+        if arguments.service_operation == "remove-bridge":
+            target = remove_bridge(arguments.name)
+            print(json.dumps({"removed": None if target is None else str(target)}, indent=2))
+            return 0
         if arguments.service_operation == "uninstall":
             removed = uninstall_services()
             print(json.dumps({"removed": [str(item) for item in removed]}, indent=2))
@@ -162,16 +207,45 @@ async def _run(arguments: argparse.Namespace) -> int:
     raise AssertionError("unreachable operation")
 
 
+def _bridge_command(arguments: list[str]) -> list[str]:
+    command = arguments[1:] if arguments[:1] == ["--"] else arguments
+    if not command:
+        raise ValueError("provide a remote command after '--'")
+    return command
+
+
+def _exec_bridge(arguments: argparse.Namespace) -> None:
+    if not arguments.host:
+        raise ValueError("set --host or PAZUZU_HOST")
+    settings = SshSettings(
+        host=arguments.host,
+        control_path=arguments.control_path,
+        ssh_binary=arguments.ssh,
+    )
+    command = bridge_argv(
+        settings,
+        listen_host=arguments.listen_host,
+        listen_port=arguments.listen_port,
+        remote_host=arguments.remote_host,
+        remote_port=arguments.remote_port,
+        remote_command=_bridge_command(arguments.remote_command),
+    )
+    os.execv(command[0], command)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the Pazuzu CLI."""
 
     parser = _parser()
     arguments = parser.parse_args(argv)
     try:
+        if arguments.operation == "bridge":
+            _exec_bridge(arguments)
+            raise AssertionError("os.execv returned")
         return asyncio.run(_run(arguments))
     except KeyboardInterrupt:
         return 130
-    except (OSError, PazuzuError, TypeError, ValueError) as exc:
+    except (OSError, PazuzuError, RuntimeError, TypeError, ValueError) as exc:
         parser.exit(2, f"pazuzu: {exc}\n")
 
 
