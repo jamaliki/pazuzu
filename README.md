@@ -169,9 +169,9 @@ request completes.
 ## Managed service bridges
 
 Use a bridge when a lightweight remote HTTP service should remain available on
-a local loopback port without installing that service locally. The bridge opens
-one channel through Pazuzu's existing ControlMaster, forwards the port, and runs
-the remote command in that same channel:
+a local loopback port without installing that service locally. The bridge
+registers the forward on Pazuzu's existing ControlMaster and runs the remote
+command through a separate channel on that same connection:
 
 ```bash
 pazuzu bridge \
@@ -196,7 +196,8 @@ pazuzu service remove-bridge queue
 ```
 
 The local and remote listeners default to `127.0.0.1`. Remote service output is
-written to Pazuzu's normal bridge logs. When SSH disconnects, the channel and
-remote command end together; launchd retries until the gateway reconnects. A
-bridge is generic transport and does not know or cache the remote protocol,
-tools, headers, or application version.
+written to Pazuzu's normal bridge logs. The listener is removed whenever the
+remote command exits, including after a clean stop. When SSH disconnects, both
+channels end and launchd retries until the gateway reconnects. A bridge is
+generic transport and does not know or cache the remote protocol, tools,
+headers, or application version.

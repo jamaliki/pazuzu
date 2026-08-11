@@ -26,7 +26,7 @@ from .launchd import (
     uninstall_services,
 )
 from .ssh import OpenSshSupervisor, SshSettings
-from .transport import bridge_argv
+from .transport import run_bridge
 
 
 def _path(value: str) -> Path:
@@ -214,7 +214,7 @@ def _bridge_command(arguments: list[str]) -> list[str]:
     return command
 
 
-def _exec_bridge(arguments: argparse.Namespace) -> None:
+def _exec_bridge(arguments: argparse.Namespace) -> int:
     if not arguments.host:
         raise ValueError("set --host or PAZUZU_HOST")
     settings = SshSettings(
@@ -222,7 +222,7 @@ def _exec_bridge(arguments: argparse.Namespace) -> None:
         control_path=arguments.control_path,
         ssh_binary=arguments.ssh,
     )
-    command = bridge_argv(
+    return run_bridge(
         settings,
         listen_host=arguments.listen_host,
         listen_port=arguments.listen_port,
@@ -230,7 +230,6 @@ def _exec_bridge(arguments: argparse.Namespace) -> None:
         remote_port=arguments.remote_port,
         remote_command=_bridge_command(arguments.remote_command),
     )
-    os.execv(command[0], command)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -240,8 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     try:
         if arguments.operation == "bridge":
-            _exec_bridge(arguments)
-            raise AssertionError("os.execv returned")
+            return _exec_bridge(arguments)
         return asyncio.run(_run(arguments))
     except KeyboardInterrupt:
         return 130

@@ -227,16 +227,15 @@ class OpenSshTransport:
         return f"{prefix}: {detail}" if detail else prefix
 
 
-def bridge_argv(
+def _bridge_spec(
     settings: SshSettings,
     *,
     listen_host: str,
     listen_port: int,
     remote_host: str,
     remote_port: int,
-    remote_command: list[str],
-) -> list[str]:
-    """Build a foreground service bridge that can only reuse Pazuzu's master."""
+) -> str:
+    """Validate and serialize one loopback forwarding rule."""
 
     settings.validate()
     if not listen_host or not remote_host or any(
@@ -245,9 +244,57 @@ def bridge_argv(
         raise ValueError("bridge hosts must be non-empty and contain no NUL bytes")
     if not 1 <= listen_port <= 65535 or not 1 <= remote_port <= 65535:
         raise ValueError("bridge ports must be between 1 and 65535")
+    return f"{listen_host}:{listen_port}:{remote_host}:{remote_port}"
+
+
+def bridge_control_argv(
+    settings: SshSettings,
+    *,
+    operation: str,
+    listen_host: str,
+    listen_port: int,
+    remote_host: str,
+    remote_port: int,
+) -> list[str]:
+    """Build a deterministic forward/cancel operation for Pazuzu's master."""
+
+    if operation not in {"forward", "cancel"}:
+        raise ValueError("bridge control operation must be forward or cancel")
+    forward = _bridge_spec(
+        settings,
+        listen_host=listen_host,
+        listen_port=listen_port,
+        remote_host=remote_host,
+        remote_port=remote_port,
+    )
+    return [
+        settings.ssh_binary,
+        "-S",
+        str(settings.control_path),
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ProxyCommand=/usr/bin/false",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-O",
+        operation,
+        "-L",
+        forward,
+        settings.host,
+    ]
+
+
+def bridge_session_argv(
+    settings: SshSettings,
+    *,
+    remote_command: list[str],
+) -> list[str]:
+    """Build the service channel, with direct SSH fallback disabled."""
+
+    settings.validate()
     if not remote_command or any(not item or "\x00" in item for item in remote_command):
         raise ValueError("bridge remote command must contain non-empty arguments")
-    forward = f"{listen_host}:{listen_port}:{remote_host}:{remote_port}"
     return [
         settings.ssh_binary,
         "-T",
@@ -259,13 +306,78 @@ def bridge_argv(
         "ControlPersist=no",
         "-o",
         "ProxyCommand=/usr/bin/false",
-        "-o",
-        "ExitOnForwardFailure=yes",
-        "-L",
-        forward,
         settings.host,
         f"exec {shlex.join(remote_command)}",
     ]
 
 
-__all__ = ["OpenSshTransport", "SshSettings", "bridge_argv"]
+def _control_bridge(argv: list[str], *, required: bool) -> None:
+    try:
+        result = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=10.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if required:
+            raise ConnectionUnavailable(f"could not manage bridge forward: {exc}") from exc
+        return
+    if required and result.returncode != 0:
+        detail = result.stdout[-4096:].decode(errors="replace").strip()
+        raise ConnectionUnavailable(detail or "could not register bridge forward")
+
+
+def run_bridge(
+    settings: SshSettings,
+    *,
+    listen_host: str,
+    listen_port: int,
+    remote_host: str,
+    remote_port: int,
+    remote_command: list[str],
+) -> int:
+    """Own one forward and remote service for exactly the same lifetime."""
+
+    control = {
+        "listen_host": listen_host,
+        "listen_port": listen_port,
+        "remote_host": remote_host,
+        "remote_port": remote_port,
+    }
+    cancel_argv = bridge_control_argv(settings, operation="cancel", **control)
+    forward_argv = bridge_control_argv(settings, operation="forward", **control)
+    session_argv = bridge_session_argv(settings, remote_command=remote_command)
+
+    # A SIGKILL may have prevented a previous instance from cleaning up.
+    _control_bridge(cancel_argv, required=False)
+    _control_bridge(forward_argv, required=True)
+    try:
+        child = subprocess.Popen(session_argv)
+
+        def relay_signal(signum: int, _frame: object) -> None:
+            if child.poll() is None:
+                child.send_signal(signum)
+
+        previous = {
+            signum: signal.signal(signum, relay_signal)
+            for signum in (signal.SIGINT, signal.SIGTERM)
+        }
+        try:
+            return child.wait()
+        finally:
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
+    finally:
+        _control_bridge(cancel_argv, required=False)
+
+
+__all__ = [
+    "OpenSshTransport",
+    "SshSettings",
+    "bridge_control_argv",
+    "bridge_session_argv",
+    "run_bridge",
+]

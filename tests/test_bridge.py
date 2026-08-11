@@ -6,7 +6,13 @@ from unittest import mock
 
 from pazuzu import launchd
 from pazuzu.cli import _parser
-from pazuzu.transport import SshSettings, bridge_argv
+from pazuzu.errors import ConnectionUnavailable
+from pazuzu.transport import (
+    SshSettings,
+    bridge_control_argv,
+    bridge_session_argv,
+    run_bridge,
+)
 
 
 class BridgeTests(unittest.TestCase):
@@ -31,23 +37,74 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(["/remote/bin/server", "--flag"], arguments.remote_command)
 
     def test_bridge_reuses_the_master_without_direct_fallback(self) -> None:
-        arguments = bridge_argv(
+        settings = SshSettings(host="example-host", control_path=Path("/tmp/pazuzu.ctl"))
+        control = bridge_control_argv(
+            settings,
+            operation="forward",
+            listen_host="127.0.0.1",
+            listen_port=8766,
+            remote_host="127.0.0.1",
+            remote_port=18766,
+        )
+        session = bridge_session_argv(
+            settings,
+            remote_command=["/remote/bin/server", "--name", "value with spaces"],
+        )
+
+        self.assertEqual("/usr/bin/ssh", control[0])
+        self.assertIn("ProxyCommand=/usr/bin/false", control)
+        self.assertIn("ExitOnForwardFailure=yes", control)
+        self.assertIn("127.0.0.1:8766:127.0.0.1:18766", control)
+        self.assertEqual("forward", control[control.index("-O") + 1])
+        self.assertEqual("example-host", session[-2])
+        self.assertEqual(
+            "exec /remote/bin/server --name 'value with spaces'", session[-1]
+        )
+
+    @mock.patch("pazuzu.transport.signal.signal")
+    @mock.patch("pazuzu.transport.subprocess.Popen")
+    @mock.patch("pazuzu.transport.subprocess.run")
+    def test_bridge_cleans_stale_and_final_forwards(
+        self, run: mock.Mock, popen: mock.Mock, _signal: mock.Mock
+    ) -> None:
+        run.return_value = mock.Mock(returncode=0, stdout=b"")
+        popen.return_value.wait.return_value = 17
+
+        result = run_bridge(
             SshSettings(host="example-host", control_path=Path("/tmp/pazuzu.ctl")),
             listen_host="127.0.0.1",
             listen_port=8766,
             remote_host="127.0.0.1",
             remote_port=18766,
-            remote_command=["/remote/bin/server", "--name", "value with spaces"],
+            remote_command=["/remote/bin/server"],
         )
 
-        self.assertEqual("/usr/bin/ssh", arguments[0])
-        self.assertIn("ProxyCommand=/usr/bin/false", arguments)
-        self.assertIn("ExitOnForwardFailure=yes", arguments)
-        self.assertIn("127.0.0.1:8766:127.0.0.1:18766", arguments)
-        self.assertEqual("example-host", arguments[-2])
-        self.assertEqual(
-            "exec /remote/bin/server --name 'value with spaces'", arguments[-1]
-        )
+        self.assertEqual(17, result)
+        self.assertEqual(3, run.call_count)
+        operations = [call.args[0][call.args[0].index("-O") + 1] for call in run.call_args_list]
+        self.assertEqual(["cancel", "forward", "cancel"], operations)
+
+    @mock.patch("pazuzu.transport.subprocess.Popen")
+    @mock.patch("pazuzu.transport.subprocess.run")
+    def test_bridge_does_not_start_service_when_forward_fails(
+        self, run: mock.Mock, popen: mock.Mock
+    ) -> None:
+        run.side_effect = [
+            mock.Mock(returncode=255, stdout=b"nothing to cancel"),
+            mock.Mock(returncode=255, stdout=b"forward refused"),
+        ]
+
+        with self.assertRaisesRegex(ConnectionUnavailable, "forward refused"):
+            run_bridge(
+                SshSettings(host="example-host", control_path=Path("/tmp/pazuzu.ctl")),
+                listen_host="127.0.0.1",
+                listen_port=8766,
+                remote_host="127.0.0.1",
+                remote_port=18766,
+                remote_command=["/remote/bin/server"],
+            )
+
+        popen.assert_not_called()
 
     @mock.patch("pazuzu.launchd._install")
     @mock.patch("pazuzu.launchd._executable", return_value=Path("/local/bin/pazuzu"))
