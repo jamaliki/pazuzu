@@ -131,7 +131,10 @@ class OpenSshSupervisor:
         """Clear backoff and immediately establish a fresh connection."""
 
         self._next_attempt = 0.0
-        await self._connect(force=True)
+        try:
+            await self._connect(force=True)
+        finally:
+            self._wake.set()
         return await self.health(probe=False)
 
     async def health(self, *, probe: bool = False) -> dict[str, Any]:
@@ -161,6 +164,10 @@ class OpenSshSupervisor:
 
     async def _maintain(self) -> None:
         while not self._closed:
+            if self._state == "authentication_required":
+                await self._wake.wait()
+                self._wake.clear()
+                continue
             delay = self.settings.probe_interval if self._state == "connected" else max(
                 0.0, self._next_attempt - time.monotonic()
             )

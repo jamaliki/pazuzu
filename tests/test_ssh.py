@@ -145,6 +145,24 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(int(auth_pid), 0)
 
+    async def test_background_maintenance_waits_for_manual_reauthentication(self) -> None:
+        self.update_state(auth_required=True)
+        supervisor = self.supervisor(probe_interval=0.01)
+        await supervisor.start()
+        try:
+            with self.assertRaises(ConnectionUnavailable):
+                await supervisor.execute("before-login")
+            attempts = self.read_state()["master_attempts"]
+            await asyncio.sleep(0.1)
+            self.assertEqual(attempts, self.read_state()["master_attempts"])
+
+            self.update_state(auth_required=False)
+            connected = await supervisor.reconnect()
+        finally:
+            await supervisor.close()
+
+        self.assertEqual("connected", connected["connection"])
+
     async def test_background_probe_repairs_a_poisoned_master(self) -> None:
         supervisor = self.supervisor(probe_interval=0.05)
         await supervisor.start()
