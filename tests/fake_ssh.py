@@ -83,6 +83,11 @@ def run_control(control_path: Path, operation: str) -> int:
 
 def run_master(control_path: Path) -> int:
     state = read_state()
+    if state.get("auth_wait"):
+        update_state(lambda current: current.update(auth_wait_pid=os.getpid()))
+        print("Waiting on browser...", file=sys.stderr, flush=True)
+        time.sleep(60)
+        return 255
     if state.get("auth_required"):
         print("SSH provider authentication required; renew credentials", file=sys.stderr)
         return 255

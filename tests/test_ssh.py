@@ -128,6 +128,23 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("connected", connected["connection"])
         self.assertEqual("ran:after-login\n", result.stdout)
 
+    async def test_close_kills_master_waiting_for_browser_auth(self) -> None:
+        self.update_state(auth_wait=True)
+        supervisor = self.supervisor(connect_timeout=30.0)
+        await supervisor.start()
+        auth_pid = None
+        for _ in range(100):
+            auth_pid = self.read_state().get("auth_wait_pid")
+            if auth_pid:
+                break
+            await asyncio.sleep(0.01)
+
+        await supervisor.close()
+
+        self.assertIsNotNone(auth_pid)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(auth_pid), 0)
+
     async def test_background_probe_repairs_a_poisoned_master(self) -> None:
         supervisor = self.supervisor(probe_interval=0.05)
         await supervisor.start()

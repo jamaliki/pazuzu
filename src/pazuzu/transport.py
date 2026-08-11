@@ -76,14 +76,30 @@ class OpenSshTransport:
                 _spawn_master, self._master_argv(), self._master_log
             )
         except OSError as exc:
+            self._release_master_state()
             raise ConnectionUnavailable(f"could not launch OpenSSH master: {exc}") from exc
-        await self._wait_until_ready()
+        try:
+            await self._wait_until_ready()
+        except BaseException:
+            await self._stop_owned_master()
+            self._release_master_state()
+            raise
 
     async def stop_master(self) -> None:
         """Stop either the owned process or an adopted orphan."""
 
         if await self.control_check():
             await self._control_command("exit")
+        await self._stop_owned_master()
+        self._release_master_state()
+
+    def _release_master_state(self) -> None:
+        if self._master_log is not None:
+            self._master_log.close()
+            self._master_log = None
+        self.settings.control_path.unlink(missing_ok=True)
+
+    async def _stop_owned_master(self) -> None:
         process, self._master = self._master, None
         if process is not None:
             for _ in range(20):
@@ -102,10 +118,6 @@ class OpenSshTransport:
                     os.killpg(process.pid, signal.SIGKILL)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=1.0)
-        if self._master_log is not None:
-            self._master_log.close()
-            self._master_log = None
-        self.settings.control_path.unlink(missing_ok=True)
 
     def detach_master(self) -> None:
         """Leave the independent master alive for a replacement gateway."""
