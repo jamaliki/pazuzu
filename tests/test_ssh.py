@@ -10,10 +10,16 @@ from pathlib import Path
 from unittest import mock
 
 from pazuzu.errors import ConnectionUnavailable, UncertainExecution
-from pazuzu.ssh import OpenSshSupervisor, SshSettings
+from pazuzu.ssh import OpenSshSupervisor, SshSettings, classify_connection_failure
 
 
 class SupervisorTests(unittest.IsolatedAsyncioTestCase):
+    def test_browser_authorization_wait_is_authentication_required(self) -> None:
+        self.assertEqual(
+            "authentication_required",
+            classify_connection_failure("Waiting on browser..."),
+        )
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)

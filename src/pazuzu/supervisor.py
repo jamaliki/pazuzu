@@ -20,6 +20,7 @@ AUTH_MARKERS = (
     "login required",
     "not logged in",
     "permission denied",
+    "waiting on browser",
 )
 
 
