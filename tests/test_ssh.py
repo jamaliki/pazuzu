@@ -1,0 +1,224 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import signal
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from pazuzu.errors import ConnectionUnavailable, UncertainExecution
+from pazuzu.ssh import OpenSshSupervisor, SshSettings
+
+
+class SupervisorTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.state_path = self.root / "state.json"
+        self.fake_ssh = Path(__file__).with_name("fake_ssh.py")
+        self.environment = mock.patch.dict(
+            os.environ, {"PAZUZU_FAKE_SSH_STATE": str(self.state_path)}
+        )
+        self.environment.start()
+
+    async def asyncTearDown(self) -> None:
+        self.environment.stop()
+        self.temporary.cleanup()
+
+    def supervisor(self, **overrides: object) -> OpenSshSupervisor:
+        values: dict[str, object] = {
+            "host": "test-host",
+            "control_path": self.root / "ssh.ctl",
+            "ssh_binary": str(self.fake_ssh),
+            "connect_timeout": 1.0,
+            "probe_timeout": 2.0,
+            "probe_interval": 60.0,
+            "connection_attempts": 1,
+            "max_output_bytes": 32,
+        }
+        values.update(overrides)
+        return OpenSshSupervisor(SshSettings(**values))  # type: ignore[arg-type]
+
+    def update_state(self, **values: object) -> None:
+        current = json.loads(self.state_path.read_text()) if self.state_path.exists() else {}
+        current.update(values)
+        self.state_path.write_text(json.dumps(current))
+
+    def read_state(self) -> dict[str, object]:
+        return json.loads(self.state_path.read_text())
+
+    async def test_executes_with_stdin_and_bounds_output(self) -> None:
+        supervisor = self.supervisor()
+        try:
+            echoed = await supervisor.execute("cat", stdin=b"hello")
+            large = await supervisor.execute("large-output")
+        finally:
+            await supervisor.close()
+
+        self.assertEqual("hello", echoed.stdout)
+        self.assertEqual(0, echoed.exit_code)
+        self.assertEqual(32, len(large.stdout))
+        self.assertTrue(large.stdout_truncated)
+
+    async def test_safe_command_repairs_and_replays_once(self) -> None:
+        supervisor = self.supervisor()
+        try:
+            await supervisor.execute("first")
+            self.update_state(fail_next=True)
+            result = await supervisor.execute("read-only", retry_safe=True)
+        finally:
+            await supervisor.close()
+
+        self.assertEqual("ran:read-only\n", result.stdout)
+        self.assertTrue(result.replayed)
+        self.assertEqual(2, result.connection_generation)
+        state = self.read_state()
+        self.assertEqual(2, state["master_starts"], state.get("events"))
+
+    async def test_unsafe_command_is_not_replayed_but_connection_recovers(self) -> None:
+        supervisor = self.supervisor()
+        try:
+            await supervisor.execute("first")
+            self.update_state(fail_next=True)
+            with self.assertRaisesRegex(UncertainExecution, "not replayed"):
+                await supervisor.execute("sbatch job.sh")
+            recovered = await supervisor.execute("after")
+        finally:
+            await supervisor.close()
+
+        self.assertEqual("ran:after\n", recovered.stdout)
+        self.assertEqual(2, self.read_state()["master_starts"])
+
+    async def test_remote_exit_255_does_not_replace_healthy_master(self) -> None:
+        supervisor = self.supervisor()
+        try:
+            await supervisor.execute("first")
+            result = await supervisor.execute("exit-255")
+        finally:
+            await supervisor.close()
+
+        self.assertEqual(255, result.exit_code)
+        self.assertEqual(1, result.connection_generation)
+        self.assertEqual(1, self.read_state()["master_starts"])
+
+    async def test_authentication_state_survives_and_manual_reconnects(self) -> None:
+        self.update_state(auth_required=True)
+        supervisor = self.supervisor()
+        try:
+            with self.assertRaises(ConnectionUnavailable):
+                await supervisor.execute("first")
+            unavailable = await supervisor.health()
+            self.update_state(auth_required=False)
+            connected = await supervisor.reconnect()
+            result = await supervisor.execute("after-login")
+        finally:
+            await supervisor.close()
+
+        self.assertEqual("authentication_required", unavailable["connection"])
+        self.assertIn("authentication required", unavailable["last_error"])
+        self.assertEqual("connected", connected["connection"])
+        self.assertEqual("ran:after-login\n", result.stdout)
+
+    async def test_background_probe_repairs_a_poisoned_master(self) -> None:
+        supervisor = self.supervisor(probe_interval=0.05)
+        await supervisor.start()
+        try:
+            for _ in range(100):
+                if (await supervisor.health())["connection"] == "connected":
+                    break
+                await asyncio.sleep(0.02)
+            self.update_state(healthy=False)
+            for _ in range(150):
+                current = await supervisor.health()
+                if (
+                    self.read_state().get("master_starts") == 2
+                    and current["connection"] == "connected"
+                ):
+                    break
+                await asyncio.sleep(0.02)
+            health = await supervisor.health(probe=True)
+        finally:
+            await supervisor.close()
+
+        state = self.read_state()
+        self.assertEqual(2, state["master_starts"], state.get("events"))
+        self.assertEqual("connected", health["connection"])
+        self.assertTrue(health["session_healthy"])
+
+    async def test_master_process_death_is_recovered_on_the_next_command(self) -> None:
+        supervisor = self.supervisor()
+        try:
+            await supervisor.execute("first")
+            os.kill(int(self.read_state()["master_pid"]), signal.SIGKILL)
+            for _ in range(100):
+                if not (self.root / "ssh.ctl").exists():
+                    break
+                await asyncio.sleep(0.01)
+            recovered = await supervisor.execute("after-death")
+        finally:
+            await supervisor.close()
+
+        self.assertEqual("ran:after-death\n", recovered.stdout)
+        self.assertEqual(2, self.read_state()["master_starts"])
+
+    async def test_new_gateway_adopts_a_healthy_orphaned_master(self) -> None:
+        first = self.supervisor()
+        second = self.supervisor()
+        try:
+            await first.execute("before-restart")
+            result = await second.execute("after-restart")
+        finally:
+            await second.close()
+            await first.close()
+
+        self.assertEqual("ran:after-restart\n", result.stdout)
+        self.assertEqual(1, self.read_state()["master_starts"])
+
+    async def test_background_start_adopts_a_healthy_orphaned_master(self) -> None:
+        first = self.supervisor()
+        second = self.supervisor()
+        try:
+            await first.execute("before-restart")
+            await second.start()
+            for _ in range(100):
+                if (await second.health())["connection"] == "connected":
+                    break
+                await asyncio.sleep(0.02)
+            result = await second.execute("after-restart")
+        finally:
+            await second.close()
+            await first.close()
+
+        self.assertEqual("ran:after-restart\n", result.stdout)
+        self.assertEqual(1, self.read_state()["master_starts"])
+
+    async def test_background_retry_recovers_after_transient_outage(self) -> None:
+        supervisor = self.supervisor(probe_interval=0.05)
+        await supervisor.start()
+        try:
+            await supervisor.execute("first")
+            self.update_state(healthy=False, offline=True)
+            with mock.patch("pazuzu.supervisor._bounded_backoff", return_value=0.05):
+                for _ in range(100):
+                    if (await supervisor.health())["connection"] == "offline":
+                        break
+                    await asyncio.sleep(0.02)
+                self.update_state(offline=False)
+                for _ in range(200):
+                    if (await supervisor.health())["connection"] == "connected":
+                        break
+                    await asyncio.sleep(0.02)
+            result = await supervisor.execute("after-network")
+            health = await supervisor.health()
+        finally:
+            await supervisor.close()
+
+        self.assertEqual("ran:after-network\n", result.stdout)
+        self.assertEqual("connected", health["connection"])
+
+
+if __name__ == "__main__":
+    unittest.main()
