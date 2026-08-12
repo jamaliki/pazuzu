@@ -252,6 +252,25 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("ran:after-restart\n", result.stdout)
         self.assertEqual(1, self.read_state()["master_starts"])
 
+    async def test_unreachable_recorded_master_is_reaped_before_replacement(self) -> None:
+        first = self.supervisor()
+        second = self.supervisor()
+        await first.execute("before-crash")
+        old_pid = int(self.read_state()["master_pid"])
+        await first.detach()
+        (self.root / "ssh.ctl").unlink()
+
+        try:
+            result = await second.execute("after-crash")
+            await first.transport._stop_owned_master()
+        finally:
+            await second.close()
+
+        self.assertEqual("ran:after-crash\n", result.stdout)
+        self.assertEqual(2, self.read_state()["master_starts"])
+        with self.assertRaises(ProcessLookupError):
+            os.kill(old_pid, 0)
+
     async def test_background_retry_recovers_after_transient_outage(self) -> None:
         supervisor = self.supervisor(probe_interval=0.05)
         await supervisor.start()

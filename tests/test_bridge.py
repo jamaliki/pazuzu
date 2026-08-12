@@ -61,11 +61,16 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("read -r _ <&3", session[-1])
         self.assertIn("pazuzu-bridge /remote/bin/server --name 'value with spaces'", session[-1])
 
+    @mock.patch("pazuzu.transport._wait_for_retry", return_value=True)
     @mock.patch("pazuzu.transport.signal.signal")
     @mock.patch("pazuzu.transport.subprocess.Popen")
     @mock.patch("pazuzu.transport.subprocess.run")
     def test_bridge_cleans_stale_and_final_forwards(
-        self, run: mock.Mock, popen: mock.Mock, _signal: mock.Mock
+        self,
+        run: mock.Mock,
+        popen: mock.Mock,
+        _signal: mock.Mock,
+        _wait: mock.Mock,
     ) -> None:
         run.return_value = mock.Mock(returncode=0, stdout=b"")
         popen.return_value.wait.return_value = 17
@@ -79,13 +84,13 @@ class BridgeTests(unittest.TestCase):
             remote_command=["/remote/bin/server"],
         )
 
-        self.assertEqual(17, result)
+        self.assertEqual(0, result)
         self.assertEqual(3, run.call_count)
         self.assertEqual(mock.call(mock.ANY, stdin=-1), popen.call_args)
         operations = [call.args[0][call.args[0].index("-O") + 1] for call in run.call_args_list]
         self.assertEqual(["cancel", "forward", "cancel"], operations)
 
-    @mock.patch("pazuzu.transport._wait_for_retry", return_value=False)
+    @mock.patch("pazuzu.transport._wait_for_retry", side_effect=[False, True])
     @mock.patch("pazuzu.transport.signal.signal")
     @mock.patch("pazuzu.transport.subprocess.Popen")
     @mock.patch("pazuzu.transport.subprocess.run")
@@ -114,10 +119,10 @@ class BridgeTests(unittest.TestCase):
         )
 
         self.assertEqual(0, result)
-        wait.assert_called_once_with(mock.ANY, 1.0)
+        self.assertEqual(2, wait.call_count)
         popen.assert_called_once()
 
-    @mock.patch("pazuzu.transport._wait_for_retry", return_value=False)
+    @mock.patch("pazuzu.transport._wait_for_retry", side_effect=[False, True])
     @mock.patch("pazuzu.transport.signal.signal")
     @mock.patch("pazuzu.transport.subprocess.Popen")
     @mock.patch("pazuzu.transport.subprocess.run")
@@ -144,8 +149,8 @@ class BridgeTests(unittest.TestCase):
             remote_command=["/remote/bin/server"],
         )
 
-        self.assertEqual(7, result)
-        wait.assert_called_once_with(mock.ANY, 1.0)
+        self.assertEqual(0, result)
+        self.assertEqual(2, wait.call_count)
         self.assertEqual(2, popen.call_count)
 
     @mock.patch("pazuzu.transport.subprocess.Popen")

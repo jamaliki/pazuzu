@@ -227,6 +227,7 @@ The local and remote listeners default to `127.0.0.1`. Remote service output is
 written to Pazuzu's normal bridge logs. The listener is removed whenever the
 remote command exits, including after a clean stop. A private stdin lease also
 stops the remote process when the bridge or SSH transport disappears. An SSH
-transport failure reconnects inside the same bridge process; a genuine remote
-application exit is returned to launchd. A bridge is generic transport and does
-not know or cache the remote protocol, tools, headers, or application version.
+transport failure and a remote application exit both restart with capped
+backoff inside the same bridge process. Only stopping the bridge itself ends
+that resident loop. A bridge is generic transport and does not know or cache
+the remote protocol, tools, headers, or application version.

@@ -30,6 +30,58 @@ def _spawn_master(argv: list[str], log_handle: Any) -> subprocess.Popen[bytes]:
     )
 
 
+def _master_owner_file(control_path: Path) -> Path:
+    return control_path.with_suffix(control_path.suffix + ".owner")
+
+
+def _write_master_owner(control_path: Path, pid: int) -> None:
+    target = _master_owner_file(control_path)
+    temporary = target.with_name(f".{target.name}.{pid}.tmp")
+    try:
+        with temporary.open("x", encoding="ascii") as handle:
+            os.chmod(temporary, 0o600)
+            handle.write(f"{pid}\n")
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_master_owner(control_path: Path) -> int | None:
+    try:
+        value = _master_owner_file(control_path).read_text(encoding="ascii").strip()
+    except OSError:
+        return None
+    return int(value) if value.isascii() and value.isdecimal() and int(value) > 0 else None
+
+
+def _is_recorded_master(settings: SshSettings, pid: int) -> bool:
+    """Verify a receipt still identifies this exact session-leading master."""
+
+    try:
+        if os.getpgid(pid) != pid:
+            return False
+        result = subprocess.run(
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    command = result.stdout.strip()
+    return result.returncode == 0 and all(
+        token in command
+        for token in (
+            settings.ssh_binary,
+            " -N ",
+            str(settings.control_path),
+            "ControlMaster=yes",
+            settings.host,
+        )
+    )
+
+
 @dataclass(frozen=True)
 class ShellAttachment:
     """Snapshot describing one fail-closed interactive SSH attachment."""
@@ -140,6 +192,14 @@ class OpenSshTransport:
             self._release_master_state()
             raise ConnectionUnavailable(f"could not launch OpenSSH master: {exc}") from exc
         try:
+            _write_master_owner(control_path, self._master.pid)
+        except OSError as exc:
+            await self._stop_owned_master()
+            self._release_master_state()
+            raise ConnectionUnavailable(
+                f"could not persist OpenSSH master ownership: {exc}"
+            ) from exc
+        try:
             await self._wait_until_ready()
         except BaseException:
             await self._stop_owned_master()
@@ -152,6 +212,7 @@ class OpenSshTransport:
         if await self.control_check():
             await self._control_command("exit")
         await self._stop_owned_master()
+        await self._stop_recorded_master()
         self._release_master_state()
 
     def _release_master_state(self) -> None:
@@ -159,6 +220,22 @@ class OpenSshTransport:
             self._master_log.close()
             self._master_log = None
         self.settings.control_path.unlink(missing_ok=True)
+        _master_owner_file(self.settings.control_path).unlink(missing_ok=True)
+
+    async def _stop_recorded_master(self) -> None:
+        pid = _read_master_owner(self.settings.control_path)
+        if pid is None or not await asyncio.to_thread(
+            _is_recorded_master, self.settings, pid
+        ):
+            return
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pid, signal.SIGTERM)
+        for _ in range(20):
+            if not await asyncio.to_thread(_is_recorded_master, self.settings, pid):
+                return
+            await asyncio.sleep(0.1)
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pid, signal.SIGKILL)
 
     async def _stop_owned_master(self) -> None:
         process, self._master = self._master, None
@@ -474,7 +551,7 @@ def run_bridge(
                 continue
 
             forward_registered = True
-            delay = 1.0
+            started_at = time.monotonic()
             try:
                 # The open stdin pipe is a lease. Its EOF makes the remote
                 # wrapper stop the service when this channel disappears.
@@ -489,10 +566,17 @@ def run_bridge(
 
             if stop.is_set():
                 return 0
-            if exit_code != 255:
-                return exit_code
+            if time.monotonic() - started_at >= 60.0:
+                delay = 1.0
+            print(
+                f"pazuzu bridge: remote service exited with {exit_code}; "
+                f"retrying in {delay:g}s",
+                file=sys.stderr,
+                flush=True,
+            )
             if _wait_for_retry(stop, delay):
                 return 0
+            delay = min(30.0, delay * 2.0)
         return 0
     finally:
         if forward_registered:
