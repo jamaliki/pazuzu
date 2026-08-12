@@ -8,6 +8,8 @@ import os
 import shlex
 import signal
 import subprocess
+import sys
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -413,6 +415,12 @@ def _control_bridge(argv: list[str], *, required: bool) -> None:
         raise ConnectionUnavailable(detail or "could not register bridge forward")
 
 
+def _wait_for_retry(stop: threading.Event, delay: float) -> bool:
+    """Wait without delaying a requested bridge shutdown."""
+
+    return stop.wait(delay)
+
+
 def run_bridge(
     settings: SshSettings,
     *,
@@ -422,7 +430,7 @@ def run_bridge(
     remote_port: int,
     remote_command: list[str],
 ) -> int:
-    """Own one forward and remote service for exactly the same lifetime."""
+    """Keep one forward and remote service alive across master reconnects."""
 
     control = {
         "listen_host": listen_host,
@@ -434,31 +442,63 @@ def run_bridge(
     forward_argv = bridge_control_argv(settings, operation="forward", **control)
     session_argv = bridge_session_argv(settings, remote_command=remote_command)
 
-    # A SIGKILL may have prevented a previous instance from cleaning up.
-    _control_bridge(cancel_argv, required=False)
-    _control_bridge(forward_argv, required=True)
+    stop = threading.Event()
+    child: subprocess.Popen[bytes] | None = None
+    forward_registered = False
+
+    def relay_signal(_signum: int, _frame: object) -> None:
+        stop.set()
+        if child is not None and child.poll() is None and child.stdin is not None:
+            child.stdin.close()
+
+    previous = {
+        signum: signal.signal(signum, relay_signal)
+        for signum in (signal.SIGINT, signal.SIGTERM)
+    }
     try:
-        # The open stdin pipe is a lease. Its EOF makes the remote wrapper stop
-        # the service even if a multiplexed SSH channel otherwise survives.
-        child = subprocess.Popen(session_argv, stdin=subprocess.PIPE)
-
-        def relay_signal(signum: int, _frame: object) -> None:
-            if child.poll() is None and child.stdin is not None:
-                child.stdin.close()
-
-        previous = {
-            signum: signal.signal(signum, relay_signal)
-            for signum in (signal.SIGINT, signal.SIGTERM)
-        }
-        try:
-            return child.wait()
-        finally:
-            if child.stdin is not None and not child.stdin.closed:
-                child.stdin.close()
-            for signum, handler in previous.items():
-                signal.signal(signum, handler)
-    finally:
+        # A SIGKILL may have prevented a previous instance from cleaning up.
         _control_bridge(cancel_argv, required=False)
+        delay = 1.0
+        while not stop.is_set():
+            try:
+                _control_bridge(forward_argv, required=True)
+            except ConnectionUnavailable as exc:
+                print(
+                    f"pazuzu bridge: {exc}; retrying in {delay:g}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if _wait_for_retry(stop, delay):
+                    return 0
+                delay = min(30.0, delay * 2.0)
+                continue
+
+            forward_registered = True
+            delay = 1.0
+            try:
+                # The open stdin pipe is a lease. Its EOF makes the remote
+                # wrapper stop the service when this channel disappears.
+                child = subprocess.Popen(session_argv, stdin=subprocess.PIPE)
+                exit_code = child.wait()
+            finally:
+                if child is not None and child.stdin is not None and not child.stdin.closed:
+                    child.stdin.close()
+                child = None
+                _control_bridge(cancel_argv, required=False)
+                forward_registered = False
+
+            if stop.is_set():
+                return 0
+            if exit_code != 255:
+                return exit_code
+            if _wait_for_retry(stop, delay):
+                return 0
+        return 0
+    finally:
+        if forward_registered:
+            _control_bridge(cancel_argv, required=False)
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 __all__ = [

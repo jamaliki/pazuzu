@@ -33,6 +33,21 @@ class LaunchdTests(unittest.TestCase):
         self.assertEqual(Path("agent.plist"), installed)
         self.assertEqual(6, launchctl.call_count)
 
+    @mock.patch("pazuzu.launchd._bridge_labels", return_value=["bridge"])
+    @mock.patch("pazuzu.launchd._ready", side_effect=[True, False, False])
+    @mock.patch("pazuzu.launchd._loaded", side_effect=[True, True, False])
+    def test_service_status_distinguishes_ready_waiting_and_unloaded(
+        self, _loaded: mock.Mock, _ready: mock.Mock, _bridges: mock.Mock
+    ) -> None:
+        self.assertEqual(
+            {
+                launchd.GATEWAY_LABEL: "ready",
+                launchd.MCP_LABEL: "waiting",
+                "bridge": "not_loaded",
+            },
+            launchd.service_status(),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

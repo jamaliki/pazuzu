@@ -6,7 +6,6 @@ from unittest import mock
 
 from pazuzu import launchd
 from pazuzu.cli import _parser
-from pazuzu.errors import ConnectionUnavailable
 from pazuzu.transport import (
     SshSettings,
     bridge_control_argv,
@@ -86,26 +85,95 @@ class BridgeTests(unittest.TestCase):
         operations = [call.args[0][call.args[0].index("-O") + 1] for call in run.call_args_list]
         self.assertEqual(["cancel", "forward", "cancel"], operations)
 
+    @mock.patch("pazuzu.transport._wait_for_retry", return_value=False)
+    @mock.patch("pazuzu.transport.signal.signal")
     @mock.patch("pazuzu.transport.subprocess.Popen")
     @mock.patch("pazuzu.transport.subprocess.run")
-    def test_bridge_does_not_start_service_when_forward_fails(
-        self, run: mock.Mock, popen: mock.Mock
+    def test_bridge_waits_for_master_instead_of_exiting(
+        self,
+        run: mock.Mock,
+        popen: mock.Mock,
+        _signal: mock.Mock,
+        wait: mock.Mock,
+    ) -> None:
+        run.side_effect = [
+            mock.Mock(returncode=255, stdout=b"nothing to cancel"),
+            mock.Mock(returncode=255, stdout=b"control socket missing"),
+            mock.Mock(returncode=0, stdout=b""),
+            mock.Mock(returncode=0, stdout=b""),
+        ]
+        popen.return_value.wait.return_value = 0
+
+        result = run_bridge(
+            SshSettings(host="example-host", control_path=Path("/tmp/pazuzu.ctl")),
+            listen_host="127.0.0.1",
+            listen_port=8766,
+            remote_host="127.0.0.1",
+            remote_port=18766,
+            remote_command=["/remote/bin/server"],
+        )
+
+        self.assertEqual(0, result)
+        wait.assert_called_once_with(mock.ANY, 1.0)
+        popen.assert_called_once()
+
+    @mock.patch("pazuzu.transport._wait_for_retry", return_value=False)
+    @mock.patch("pazuzu.transport.signal.signal")
+    @mock.patch("pazuzu.transport.subprocess.Popen")
+    @mock.patch("pazuzu.transport.subprocess.run")
+    def test_bridge_reconnects_after_transport_channel_closes(
+        self,
+        run: mock.Mock,
+        popen: mock.Mock,
+        _signal: mock.Mock,
+        wait: mock.Mock,
+    ) -> None:
+        run.return_value = mock.Mock(returncode=0, stdout=b"")
+        first = mock.Mock()
+        first.wait.return_value = 255
+        second = mock.Mock()
+        second.wait.return_value = 7
+        popen.side_effect = [first, second]
+
+        result = run_bridge(
+            SshSettings(host="example-host", control_path=Path("/tmp/pazuzu.ctl")),
+            listen_host="127.0.0.1",
+            listen_port=8766,
+            remote_host="127.0.0.1",
+            remote_port=18766,
+            remote_command=["/remote/bin/server"],
+        )
+
+        self.assertEqual(7, result)
+        wait.assert_called_once_with(mock.ANY, 1.0)
+        self.assertEqual(2, popen.call_count)
+
+    @mock.patch("pazuzu.transport.subprocess.Popen")
+    @mock.patch("pazuzu.transport.subprocess.run")
+    @mock.patch("pazuzu.transport._wait_for_retry", return_value=True)
+    @mock.patch("pazuzu.transport.signal.signal")
+    def test_bridge_does_not_start_service_while_forward_fails(
+        self,
+        _signal: mock.Mock,
+        _wait: mock.Mock,
+        run: mock.Mock,
+        popen: mock.Mock,
     ) -> None:
         run.side_effect = [
             mock.Mock(returncode=255, stdout=b"nothing to cancel"),
             mock.Mock(returncode=255, stdout=b"forward refused"),
         ]
 
-        with self.assertRaisesRegex(ConnectionUnavailable, "forward refused"):
-            run_bridge(
-                SshSettings(host="example-host", control_path=Path("/tmp/pazuzu.ctl")),
-                listen_host="127.0.0.1",
-                listen_port=8766,
-                remote_host="127.0.0.1",
-                remote_port=18766,
-                remote_command=["/remote/bin/server"],
-            )
+        result = run_bridge(
+            SshSettings(host="example-host", control_path=Path("/tmp/pazuzu.ctl")),
+            listen_host="127.0.0.1",
+            listen_port=8766,
+            remote_host="127.0.0.1",
+            remote_port=18766,
+            remote_command=["/remote/bin/server"],
+        )
 
+        self.assertEqual(0, result)
         popen.assert_not_called()
 
     @mock.patch("pazuzu.launchd._install")

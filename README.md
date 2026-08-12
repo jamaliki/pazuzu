@@ -204,9 +204,10 @@ pazuzu bridge \
   -- /remote/bin/service --host 127.0.0.1 --port 18766
 ```
 
-It cannot create a direct SSH connection: if Pazuzu's master is unavailable,
-the bridge exits. For an auto-restarting bridge, install the gateway first and
-then install a named LaunchAgent:
+It cannot create a direct SSH connection. If Pazuzu's master is temporarily
+unavailable, the bridge remains resident and retries the forward with capped
+backoff; it does not start the remote service until the master is ready. Install
+the gateway first and then install a named LaunchAgent:
 
 ```bash
 pazuzu service install-bridge queue \
@@ -218,10 +219,14 @@ pazuzu service status
 pazuzu service remove-bridge queue
 ```
 
+`pazuzu service status` reports `ready` only when the managed listener is
+reachable, `waiting` while a loaded service is reconnecting, and `not_loaded`
+when no LaunchAgent is loaded.
+
 The local and remote listeners default to `127.0.0.1`. Remote service output is
 written to Pazuzu's normal bridge logs. The listener is removed whenever the
 remote command exits, including after a clean stop. A private stdin lease also
-stops the remote process when the bridge or SSH transport disappears. When SSH
-disconnects, both channels end and launchd retries until the gateway reconnects.
-A bridge is generic transport and does not know or cache the remote protocol,
-tools, headers, or application version.
+stops the remote process when the bridge or SSH transport disappears. An SSH
+transport failure reconnects inside the same bridge process; a genuine remote
+application exit is returned to launchd. A bridge is generic transport and does
+not know or cache the remote protocol, tools, headers, or application version.

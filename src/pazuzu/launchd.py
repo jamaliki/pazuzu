@@ -6,6 +6,7 @@ import contextlib
 import os
 import plistlib
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -241,6 +242,54 @@ def _bridge_labels() -> list[str]:
     return [target.stem for target in sorted(directory.glob(f"{BRIDGE_LABEL_PREFIX}*.plist"))]
 
 
+def _program_arguments(label: str) -> list[str]:
+    try:
+        with _agent_path(label).open("rb") as handle:
+            arguments = plistlib.load(handle).get("ProgramArguments", [])
+    except (OSError, plistlib.InvalidFileException):
+        return []
+    return [str(item) for item in arguments] if isinstance(arguments, list) else []
+
+
+def _option(arguments: list[str], name: str) -> str | None:
+    try:
+        return arguments[arguments.index(name) + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def _unix_listener_ready(target: Path) -> bool:
+    try:
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(0.2)
+            client.connect(str(target))
+    except OSError:
+        return False
+    return True
+
+
+def _tcp_listener_ready(host: str, port: str | None) -> bool:
+    try:
+        numeric_port = int(port or "")
+        connect_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+        with socket.create_connection((connect_host, numeric_port), timeout=0.2):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def _ready(label: str) -> bool:
+    if label == GATEWAY_LABEL:
+        return _unix_listener_ready(default_socket_path())
+    arguments = _program_arguments(label)
+    if label == MCP_LABEL:
+        return _tcp_listener_ready("127.0.0.1", _option(arguments, "--port"))
+    return _tcp_listener_ready(
+        _option(arguments, "--listen-host") or "127.0.0.1",
+        _option(arguments, "--listen-port"),
+    )
+
+
 def uninstall_services() -> list[Path]:
     """Unload and remove Pazuzu's LaunchAgents, leaving no daemon running."""
 
@@ -258,11 +307,12 @@ def uninstall_services() -> list[Path]:
 
 
 def service_status() -> dict[str, str]:
-    """Return launchd's compact state for both optional services."""
+    """Report whether each managed service is loaded and actually reachable."""
 
     statuses: dict[str, str] = {}
     for label in (GATEWAY_LABEL, MCP_LABEL, *_bridge_labels()):
-        statuses[label] = "loaded" if _loaded(label) else "not_loaded"
+        loaded = _loaded(label)
+        statuses[label] = "ready" if loaded and _ready(label) else "waiting" if loaded else "not_loaded"
     return statuses
 
 
