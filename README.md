@@ -8,6 +8,123 @@ Pazuzu does not handle SSH keys or passwords. It deliberately delegates hosts,
 users, proxies, certificates, and authentication to the user's existing
 OpenSSH configuration.
 
+## Architecture at a Glance
+
+### One Connection, Independent Channels
+
+```mermaid
+flowchart TB
+    clients["Replaceable clients
+CLI · Python · MCP adapter · dashboards"]
+    socket[["Private Unix socket
+bounded JSON requests"]]
+    gateway["Local gateway
+request routing · cancellation · status"]
+    supervisor["OpenSSH supervisor
+session limit · health · one repair lock"]
+    maintainer["Background maintainer
+real session probes · bounded backoff"]
+    master["Private ControlMaster
+one authenticated connection generation"]
+    attachments["Persistent consumers
+tmux shells · managed service bridges"]
+    remote["Configured remote host
+independent SSH channels"]
+    result[("Bounded command result
+stdout · stderr · exit code · replay status")]
+
+    clients --> socket --> gateway --> supervisor --> master --> remote --> result
+    maintainer --> supervisor
+    attachments --> master
+
+    classDef client fill:#F4F0FF,stroke:#6D5BD0,color:#241C3A,stroke-width:1.5px;
+    classDef socketNode fill:#F4EDC9,stroke:#9C7B21,color:#352B10,stroke-width:1.5px;
+    classDef core fill:#5B4B8A,stroke:#C7B9FF,color:#FFFFFF,stroke-width:1.5px;
+    classDef supervisorNode fill:#DDF7F3,stroke:#168B83,color:#123B38,stroke-width:1.5px;
+    classDef transport fill:#E8F0FF,stroke:#4977B8,color:#172D4D,stroke-width:1.5px;
+    classDef attachment fill:#FCE8DE,stroke:#D9674B,color:#44231A,stroke-width:1.5px;
+    classDef resultNode fill:#FFF4E8,stroke:#D97745,color:#3A2117,stroke-width:1.5px;
+
+    class clients client;
+    class socket socketNode;
+    class gateway core;
+    class supervisor,maintainer supervisorNode;
+    class master,remote transport;
+    class attachments attachment;
+    class result resultNode;
+    linkStyle default stroke:#88859A,stroke-width:1.5px;
+```
+
+The gateway is the stable local coordination point, but it does not proxy bytes
+through a second network stack. It opens independent OpenSSH channels through
+one private master. The MCP adapter and ordinary clients own no SSH state and
+can restart freely; a restarted gateway adopts a surviving master only after a
+real remote session probe. Shells and bridges use separate channels on that same
+master and reconnect without inventing another connection owner.
+
+### One Command and Its Recovery Policy
+
+```mermaid
+flowchart TB
+    request["Execute request
+command · stdin · timeout · retry_safe"]
+    ensure["Ensure connected
+adopt healthy master or create one"]
+    session["Open independent command channel
+direct SSH fallback disabled"]
+    exit255{"Exit code 255?"}
+    success["Return CommandResult
+bounded output · current generation"]
+    probe["Probe the same master
+open a real remote session"]
+    alive{"Probe succeeds?"}
+    remote255["Return 255 as remote result
+the connection is still usable"]
+    repair["Replace master under one lock
+advance connection generation"]
+    restored{"Connection restored?"}
+    unavailable["Raise UncertainExecution
+state is offline or authentication_required"]
+    replay{"Request explicitly retry-safe?"}
+    uncertain["Raise UncertainExecution
+never duplicate an unsafe command"]
+    once["Replay once on new generation
+return replayed=true or fail"]
+
+    request --> ensure --> session --> exit255
+    exit255 -->|no| success
+    exit255 -->|yes| probe --> alive
+    alive -->|yes| remote255
+    alive -->|no| repair --> restored
+    restored -->|no| unavailable
+    restored -->|yes| replay
+    replay -->|no| uncertain
+    replay -->|yes| once
+
+    classDef requestNode fill:#F4F0FF,stroke:#6D5BD0,color:#241C3A,stroke-width:1.5px;
+    classDef core fill:#5B4B8A,stroke:#C7B9FF,color:#FFFFFF,stroke-width:1.5px;
+    classDef transport fill:#E8F0FF,stroke:#4977B8,color:#172D4D,stroke-width:1.5px;
+    classDef choice fill:#FFF4E8,stroke:#D97745,color:#3A2117,stroke-width:1.5px;
+    classDef safe fill:#DDF7F3,stroke:#168B83,color:#123B38,stroke-width:1.5px;
+    classDef repairNode fill:#F4EDC9,stroke:#9C7B21,color:#352B10,stroke-width:1.5px;
+    classDef danger fill:#FCE8DE,stroke:#D9674B,color:#44231A,stroke-width:1.5px;
+
+    class request requestNode;
+    class ensure core;
+    class session,probe transport;
+    class exit255,alive,restored,replay choice;
+    class success,remote255,once safe;
+    class repair repairNode;
+    class unavailable,uncertain danger;
+    linkStyle default stroke:#88859A,stroke-width:1.5px;
+```
+
+Exit code 255 is evidence, not a verdict. Pazuzu first checks whether the same
+master can still open a real session. It replaces the connection only after
+that probe fails, and replays only when the caller declared the operation safe.
+Authentication failures leave the local gateway available but pause automatic
+attempts until the user reauthorizes and requests `pazuzu reconnect`.
+
 ## Why
 
 `ssh -O check` proves only that a master process answers on its control socket.
