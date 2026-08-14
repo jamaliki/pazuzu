@@ -9,11 +9,20 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from pazuzu.cli import _parser
 from pazuzu.errors import ConnectionUnavailable, UncertainExecution
+from pazuzu.process import ProcessResult
 from pazuzu.ssh import OpenSshSupervisor, SshSettings, classify_connection_failure
 
 
 class SupervisorTests(unittest.IsolatedAsyncioTestCase):
+    def test_default_session_budget_reserves_connection_headroom(self) -> None:
+        settings = SshSettings(host="test-host", control_path=Path("/tmp/pazuzu.ctl"))
+        arguments = _parser().parse_args(["serve", "--host", "test-host"])
+
+        self.assertEqual(6, settings.max_sessions)
+        self.assertEqual(settings.max_sessions, arguments.max_sessions)
+
     def test_browser_authorization_wait_is_authentication_required(self) -> None:
         self.assertEqual(
             "authentication_required",
@@ -125,6 +134,45 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(255, result.exit_code)
         self.assertEqual(1, result.connection_generation)
         self.assertEqual(1, self.read_state()["master_starts"])
+
+    async def test_health_probe_shares_the_command_session_budget(self) -> None:
+        supervisor = self.supervisor(max_sessions=1)
+        supervisor._state = "connected"
+        supervisor._generation = 1
+        command_started = asyncio.Event()
+        release_command = asyncio.Event()
+        probe_started = asyncio.Event()
+
+        async def session(
+            command: str, *, stdin: bytes = b"", timeout: float
+        ) -> ProcessResult:
+            del stdin, timeout
+            if command == "held-command":
+                command_started.set()
+                await release_command.wait()
+            elif command == "true":
+                probe_started.set()
+            return ProcessResult(0, b"", b"", False, False)
+
+        with (
+            mock.patch.object(
+                supervisor.transport,
+                "control_check",
+                new=mock.AsyncMock(return_value=True),
+            ),
+            mock.patch.object(supervisor.transport, "session", side_effect=session),
+        ):
+            command = asyncio.create_task(supervisor.execute("held-command"))
+            await command_started.wait()
+            health = asyncio.create_task(supervisor.health(probe=True))
+            await asyncio.sleep(0.05)
+            self.assertFalse(probe_started.is_set())
+            release_command.set()
+            result, status = await asyncio.gather(command, health)
+
+        self.assertEqual(0, result.exit_code)
+        self.assertTrue(probe_started.is_set())
+        self.assertTrue(status["session_healthy"])
 
     async def test_authentication_state_survives_and_manual_reconnects(self) -> None:
         self.update_state(auth_required=True)

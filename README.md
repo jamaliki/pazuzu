@@ -212,6 +212,12 @@ session once a minute, and a failed connection is retried with bounded backoff
 up to one minute. `pazuzu status --probe` distinguishes `connected`,
 `reconnecting`, `offline`, and `authentication_required`.
 
+The gateway admits six ordinary command sessions by default and health probes
+share that same budget. This leaves headroom under the common ten-session SSH
+server limit for managed bridges, an interactive shell, and connection startup.
+Override the budget with `pazuzu serve --max-sessions` only when the remote
+server's channel policy and every persistent bridge are known.
+
 When the SSH provider requires interactive reauthorization, complete that in a
 normal terminal and then bypass the remaining backoff immediately:
 
@@ -346,5 +352,11 @@ remote command exits, including after a clean stop. A private stdin lease also
 stops the remote process when the bridge or SSH transport disappears. An SSH
 transport failure and a remote application exit both restart with capped
 backoff inside the same bridge process. Only stopping the bridge itself ends
-that resident loop. A bridge is generic transport and does not know or cache
-the remote protocol, tools, headers, or application version.
+that resident loop.
+
+The remote host must provide `flock`. Replacement bridge sessions serialize on
+a private per-host, per-remote-port lock before starting the service. While an
+old service is still alive after a hard disconnect, the replacement forward can
+continue using it; once its lease ends, exactly one replacement starts without
+racing for the listening port. A bridge is generic transport and does not know
+or cache the remote protocol, tools, headers, or application version.

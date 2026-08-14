@@ -115,17 +115,18 @@ class OpenSshSupervisor:
         async with self._sessions:
             generation = await self._ensure_connected()
             result = await self.transport.session(command, stdin=stdin, timeout=timeout)
-            if result.exit_code != 255:
-                return self._command_result(result, generation)
-            repaired = await self._safe_repair_after_command(generation)
-            if not repaired:
-                return self._command_result(result, generation)
-            if not retry_safe:
-                raise UncertainExecution(
-                    "SSH disconnected after the remote command may have started; "
-                    "the connection was repaired, but the command was not replayed"
-                )
-            return await self._replay_once(command, stdin, timeout)
+        # A failed command must release its slot before the repair probe reserves one.
+        if result.exit_code != 255:
+            return self._command_result(result, generation)
+        repaired = await self._safe_repair_after_command(generation)
+        if not repaired:
+            return self._command_result(result, generation)
+        if not retry_safe:
+            raise UncertainExecution(
+                "SSH disconnected after the remote command may have started; "
+                "the connection was repaired, but the command was not replayed"
+            )
+        return await self._replay_once(command, stdin, timeout)
 
     async def reconnect(self) -> dict[str, Any]:
         """Clear backoff and immediately establish a fresh connection."""
@@ -265,15 +266,18 @@ class OpenSshSupervisor:
         async with self._lock:
             if failed_generation != self._generation and self._state == "connected":
                 return True
-            if await self.transport.probe():
+            async with self._sessions:
+                healthy = await self.transport.probe()
+            if healthy:
                 self._last_success_at = _now()
                 return False
             await self._replace_master()
             return True
 
     async def _replay_once(self, command: str, stdin: bytes, timeout: float) -> CommandResult:
-        generation = await self._ensure_connected()
-        replay = await self.transport.session(command, stdin=stdin, timeout=timeout)
+        async with self._sessions:
+            generation = await self._ensure_connected()
+            replay = await self.transport.session(command, stdin=stdin, timeout=timeout)
         if replay.exit_code == 255 and await self._repair_if_broken(generation):
             raise ConnectionUnavailable(
                 "the idempotent command lost its connection again after one replay"

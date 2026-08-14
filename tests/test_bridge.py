@@ -47,6 +47,7 @@ class BridgeTests(unittest.TestCase):
         )
         session = bridge_session_argv(
             settings,
+            remote_port=18766,
             remote_command=["/remote/bin/server", "--name", "value with spaces"],
         )
 
@@ -59,6 +60,8 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("exec sh -c", session[-1])
         self.assertIn("exec 3<&0", session[-1])
         self.assertIn("read -r _ <&3", session[-1])
+        self.assertIn("flock 9", session[-1])
+        self.assertIn("-$host-18766.lock", session[-1])
         self.assertIn("pazuzu-bridge /remote/bin/server --name 'value with spaces'", session[-1])
 
     @mock.patch("pazuzu.transport._wait_for_retry", return_value=True)

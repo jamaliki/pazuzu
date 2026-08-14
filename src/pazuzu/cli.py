@@ -27,7 +27,7 @@ from .launchd import (
 )
 from .shell import require_interactive_terminal, run_shell
 from .ssh import OpenSshSupervisor, SshSettings
-from .transport import ShellAttachment, run_bridge
+from .transport import DEFAULT_MAX_SESSIONS, ShellAttachment, run_bridge
 
 
 def _path(value: str) -> Path:
@@ -53,7 +53,7 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--socket", type=_path, default=_socket_default())
     serve.add_argument("--control-path", type=_path, default=_control_default())
     serve.add_argument("--ssh", default=os.environ.get("PAZUZU_SSH", "/usr/bin/ssh"))
-    serve.add_argument("--max-sessions", type=int, default=8)
+    serve.add_argument("--max-sessions", type=int, default=DEFAULT_MAX_SESSIONS)
     serve.add_argument("--connect-timeout", type=float, default=60.0)
     serve.add_argument("--probe-interval", type=float, default=60.0)
 

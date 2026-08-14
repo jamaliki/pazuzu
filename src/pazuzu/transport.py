@@ -19,6 +19,8 @@ from typing import Any
 from .errors import CommandTimedOut, ConnectionUnavailable
 from .process import ProcessResult, run_process
 
+DEFAULT_MAX_SESSIONS = 6
+
 
 def _spawn_master(argv: list[str], log_handle: Any) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
@@ -153,7 +155,7 @@ class SshSettings:
     keepalive_interval: int = 15
     keepalive_count: int = 3
     connection_attempts: int = 2
-    max_sessions: int = 8
+    max_sessions: int = DEFAULT_MAX_SESSIONS
     max_output_bytes: int = 1024 * 1024
 
     def validate(self) -> None:
@@ -438,15 +440,25 @@ def bridge_control_argv(
 def bridge_session_argv(
     settings: SshSettings,
     *,
+    remote_port: int,
     remote_command: list[str],
 ) -> list[str]:
     """Build the service channel, with direct SSH fallback disabled."""
 
     settings.validate()
+    if not 1 <= remote_port <= 65535:
+        raise ValueError("bridge remote port must be between 1 and 65535")
     if not remote_command or any(not item or "\x00" in item for item in remote_command):
         raise ValueError("bridge remote command must contain non-empty arguments")
     lifecycle = (
-        'child=; guard=; cleanup() { '
+        'command -v flock >/dev/null 2>&1 || { '
+        'echo "pazuzu bridge: remote flock is required" >&2; exit 69; }; '
+        'host=$(hostname) || exit 69; '
+        'case "$host" in *[!A-Za-z0-9._-]*) exit 69;; esac; '
+        'lock_root=${XDG_RUNTIME_DIR:-"$HOME/.cache"}/pazuzu/bridges; '
+        'umask 077; mkdir -p "$lock_root" || exit 69; '
+        f'exec 9>"$lock_root/bridge-$host-{remote_port}.lock" || exit 69; '
+        'flock 9 || exit 69; child=; guard=; cleanup() { '
         '[ -z "$guard" ] || kill "$guard" 2>/dev/null; '
         '[ -z "$child" ] || kill -TERM "$child" 2>/dev/null; }; '
         "trap cleanup HUP INT TERM; exec 3<&0; "
@@ -517,7 +529,11 @@ def run_bridge(
     }
     cancel_argv = bridge_control_argv(settings, operation="cancel", **control)
     forward_argv = bridge_control_argv(settings, operation="forward", **control)
-    session_argv = bridge_session_argv(settings, remote_command=remote_command)
+    session_argv = bridge_session_argv(
+        settings,
+        remote_port=remote_port,
+        remote_command=remote_command,
+    )
 
     stop = threading.Event()
     child: subprocess.Popen[bytes] | None = None
@@ -586,6 +602,7 @@ def run_bridge(
 
 
 __all__ = [
+    "DEFAULT_MAX_SESSIONS",
     "OpenSshTransport",
     "ShellAttachment",
     "SshSettings",
