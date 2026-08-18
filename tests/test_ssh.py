@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from pazuzu.cli import _parser
-from pazuzu.errors import ConnectionUnavailable, UncertainExecution
+from pazuzu.errors import CommandTimedOut, ConnectionUnavailable, UncertainExecution
 from pazuzu.process import ProcessResult
 from pazuzu.ssh import OpenSshSupervisor, SshSettings, classify_connection_failure
 
@@ -173,6 +173,38 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, result.exit_code)
         self.assertTrue(probe_started.is_set())
         self.assertTrue(status["session_healthy"])
+
+    async def test_attachment_replaces_a_master_whose_probe_times_out(self) -> None:
+        supervisor = self.supervisor()
+        supervisor._state = "connected"
+        supervisor._generation = 1
+
+        with (
+            mock.patch.object(
+                supervisor.transport,
+                "control_check",
+                new=mock.AsyncMock(return_value=True),
+            ),
+            mock.patch.object(
+                supervisor.transport,
+                "session",
+                new=mock.AsyncMock(side_effect=CommandTimedOut("probe timed out")),
+            ),
+            mock.patch.object(
+                supervisor.transport,
+                "stop_master",
+                new=mock.AsyncMock(),
+            ),
+            mock.patch.object(
+                supervisor.transport,
+                "start_master",
+                new=mock.AsyncMock(),
+            ),
+        ):
+            current = await supervisor.connection_attachment()
+
+        self.assertEqual(2, current.generation)
+        self.assertEqual("connected", (await supervisor.health())["connection"])
 
     async def test_authentication_state_survives_and_manual_reconnects(self) -> None:
         self.update_state(auth_required=True)

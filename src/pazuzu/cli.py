@@ -27,7 +27,8 @@ from .launchd import (
 )
 from .shell import require_interactive_terminal, run_shell
 from .ssh import OpenSshSupervisor, SshSettings
-from .transport import DEFAULT_MAX_SESSIONS, ShellAttachment, run_bridge
+from .transfer import copy_argv, rsync_argv, run_transfer
+from .transport import DEFAULT_MAX_SESSIONS, SshAttachment, run_bridge
 
 
 def _path(value: str) -> Path:
@@ -90,6 +91,20 @@ def _parser() -> argparse.ArgumentParser:
     )
     shell.add_argument("--socket", type=_path, default=_socket_default())
     shell.add_argument("--session", default="pazuzu")
+
+    copy = subparsers.add_parser(
+        "cp", help="copy files through the gateway-owned SSH connection"
+    )
+    copy.add_argument("--socket", type=_path, default=_socket_default())
+    copy.add_argument("--scp", default=os.environ.get("PAZUZU_SCP", "/usr/bin/scp"))
+    copy.add_argument("transfer_arguments", nargs=argparse.REMAINDER)
+
+    rsync = subparsers.add_parser(
+        "rsync", help="synchronize files through the gateway-owned SSH connection"
+    )
+    rsync.add_argument("--socket", type=_path, default=_socket_default())
+    rsync.add_argument("--rsync", default=os.environ.get("PAZUZU_RSYNC", "/usr/bin/rsync"))
+    rsync.add_argument("transfer_arguments", nargs=argparse.REMAINDER)
 
     service = subparsers.add_parser("service", help="manage auto-restarting macOS services")
     service_commands = service.add_subparsers(dest="service_operation", required=True)
@@ -214,9 +229,9 @@ async def _run(arguments: argparse.Namespace) -> int:
     if arguments.operation == "shell":
         require_interactive_terminal()
 
-        async def get_attachment() -> ShellAttachment:
+        async def get_attachment() -> SshAttachment:
             result = await call_gateway(arguments.socket, "shell_attachment", timeout=140.0)
-            return ShellAttachment.from_dict(result)
+            return SshAttachment.from_dict(result)
 
         async def reconnect() -> dict[str, object]:
             return await call_gateway(arguments.socket, "reconnect", timeout=140.0)
@@ -231,6 +246,24 @@ async def _run(arguments: argparse.Namespace) -> int:
             status=status,
             stderr=sys.stderr,
         )
+    if arguments.operation in {"cp", "rsync"}:
+        result = await call_gateway(
+            arguments.socket, "connection_attachment", timeout=140.0
+        )
+        attachment = SshAttachment.from_dict(result)
+        if arguments.operation == "cp":
+            argv = copy_argv(
+                attachment,
+                arguments.transfer_arguments,
+                executable=arguments.scp,
+            )
+        else:
+            argv = rsync_argv(
+                attachment,
+                arguments.transfer_arguments,
+                executable=arguments.rsync,
+            )
+        return await run_transfer(argv)
     raise AssertionError("unreachable operation")
 
 

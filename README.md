@@ -26,8 +26,8 @@ session limit · health · one repair lock"]
 real session probes · bounded backoff"]
     master["Private ControlMaster
 one authenticated connection generation"]
-    attachments["Persistent consumers
-tmux shells · managed service bridges"]
+    attachments["Direct byte channels
+file transfers · tmux shells · service bridges"]
     remote["Configured remote host
 independent SSH channels"]
     result[("Bounded command result
@@ -182,6 +182,34 @@ pazuzu exec -- hostname
 pazuzu exec -- 'squeue -u "$USER"'
 python3 inspect.py | pazuzu exec -- python3 -
 ```
+
+### File transfer
+
+Copy and synchronize files through the gateway-owned ControlMaster without
+putting file bytes in Pazuzu's bounded JSON protocol:
+
+```bash
+# Upload and download one file. Use normal scp flags after `--`.
+pazuzu cp -- local.txt :/remote/path/local.txt
+pazuzu cp -- :/remote/path/result.json local-result.json
+pazuzu cp -- -r local-directory :/remote/path/
+
+# Use normal rsync arguments after `--`.
+pazuzu rsync -- -av --partial local-directory/ :/remote/path/directory/
+pazuzu rsync -- -av :/remote/path/results/ local-results/
+```
+
+Exactly one operand must use Pazuzu's `:path` form. Explicit `host:path`,
+`rsync://`, SSH configuration overrides, and rsync remote-shell overrides are
+rejected so a transfer cannot silently open another connection or target a
+different host. Prefix a local filename containing a colon with `./` so it is
+unambiguously local.
+
+The native `scp` or `rsync` process owns the terminal and streams bytes directly
+through an independent channel on the existing SSH master. Pazuzu does not
+buffer file data, truncate it, or replay a transfer after a disconnect. Native
+exit codes are preserved; use rsync's `--partial` or other application-level
+recovery options when resumability is required.
 
 ### Interactive shell
 

@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import TextIO, TypeVar
 
 from .errors import ConnectionUnavailable, PazuzuError, ProtocolError
-from .transport import ShellAttachment
+from .transport import SshAttachment
 
 SESSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 TMUX_REQUIRED_MESSAGE = "pazuzu shell requires tmux on the remote host"
@@ -21,7 +21,7 @@ Complete the configured provider login in another terminal, then run
 `pazuzu reconnect`. Waiting to reattach; press Ctrl-C to stop.
 """
 
-GetAttachment = Callable[[], Awaitable[ShellAttachment]]
+GetAttachment = Callable[[], Awaitable[SshAttachment]]
 GatewayCall = Callable[[], Awaitable[Mapping[str, object]]]
 SpawnSsh = Callable[[list[str], asyncio.Event], Awaitable[int]]
 Sleep = Callable[[float], Awaitable[None]]
@@ -86,7 +86,7 @@ def remote_tmux_command(session: str) -> str:
     )
 
 
-def shell_argv(attachment: ShellAttachment, session: str) -> list[str]:
+def shell_argv(attachment: SshAttachment, session: str) -> list[str]:
     """Build an interactive SSH command that cannot open a direct connection."""
 
     return [
@@ -253,7 +253,7 @@ async def _ready_attachment(
     cancellation: asyncio.Event,
     reporter: _ConnectionReporter,
     initial_health: Mapping[str, object] | None = None,
-) -> ShellAttachment:
+) -> SshAttachment:
     health = initial_health or await _call_or_stop(status, cancellation)
     while True:
         state = _connection_state(health)

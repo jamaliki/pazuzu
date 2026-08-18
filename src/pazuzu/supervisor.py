@@ -9,9 +9,9 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from .errors import ConnectionUnavailable, UncertainExecution
+from .errors import CommandTimedOut, ConnectionUnavailable, UncertainExecution
 from .process import ProcessResult
-from .transport import OpenSshTransport, ShellAttachment, SshSettings
+from .transport import OpenSshTransport, SshAttachment, SshSettings
 
 AUTH_MARKERS = (
     "authentication failed",
@@ -138,16 +138,22 @@ class OpenSshSupervisor:
             self._wake.set()
         return await self.health(probe=False)
 
-    async def shell_attachment(self) -> ShellAttachment:
-        """Return a snapshot of the current master for an interactive client."""
+    async def connection_attachment(self) -> SshAttachment:
+        """Return a probed snapshot for a direct client of the current master."""
 
-        generation = await self._ensure_connected()
-        return ShellAttachment(
+        await self._ensure_connected()
+        await self._repair_if_broken(self._generation)
+        return SshAttachment(
             host=self.settings.host,
             ssh_binary=self.settings.ssh_binary,
             control_path=self.settings.control_path,
-            generation=generation,
+            generation=self._generation,
         )
+
+    async def shell_attachment(self) -> SshAttachment:
+        """Return a probed master snapshot for an interactive client."""
+
+        return await self.connection_attachment()
 
     async def health(self, *, probe: bool = False) -> dict[str, Any]:
         """Return bounded local and remote connection state."""
@@ -267,7 +273,10 @@ class OpenSshSupervisor:
             if failed_generation != self._generation and self._state == "connected":
                 return True
             async with self._sessions:
-                healthy = await self.transport.probe()
+                try:
+                    healthy = await self.transport.probe()
+                except CommandTimedOut:
+                    healthy = False
             if healthy:
                 self._last_success_at = _now()
                 return False

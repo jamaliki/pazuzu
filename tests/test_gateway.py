@@ -96,12 +96,26 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             descriptor,
         )
 
+    async def test_connection_attachment_exposes_the_same_probed_master(self) -> None:
+        descriptor = await call_gateway(self.socket_path, "connection_attachment")
+
+        self.assertEqual("test-host", descriptor["host"])
+        self.assertEqual(str(self.root / "ssh.ctl"), descriptor["control_path"])
+        self.assertEqual(1, descriptor["generation"])
+
     async def test_shell_attachment_rejects_parameters(self) -> None:
         with self.assertRaisesRegex(PazuzuError, "params must be empty"):
             await call_gateway(
                 self.socket_path,
                 "shell_attachment",
                 {"ssh_option": "ProxyCommand=attacker"},
+            )
+
+        with self.assertRaisesRegex(PazuzuError, "params must be empty"):
+            await call_gateway(
+                self.socket_path,
+                "connection_attachment",
+                {"host": "other-host"},
             )
 
     async def test_disconnect_cancels_only_the_abandoned_channel(self) -> None:

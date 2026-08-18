@@ -85,8 +85,8 @@ def _is_recorded_master(settings: SshSettings, pid: int) -> bool:
 
 
 @dataclass(frozen=True)
-class ShellAttachment:
-    """Snapshot describing one fail-closed interactive SSH attachment."""
+class SshAttachment:
+    """Snapshot describing one fail-closed client of the owned SSH master."""
 
     host: str
     ssh_binary: str
@@ -118,7 +118,7 @@ class ShellAttachment:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, object]) -> ShellAttachment:
+    def from_dict(cls, value: Mapping[str, object]) -> SshAttachment:
         """Parse a gateway response without accepting extra SSH configuration."""
 
         expected = {"host", "ssh_binary", "control_path", "generation"}
@@ -140,6 +140,10 @@ class ShellAttachment:
             control_path=Path(control_path),
             generation=generation,
         )
+
+
+# Kept for callers of the released interactive-shell API.
+ShellAttachment = SshAttachment
 
 
 @dataclass(frozen=True)
@@ -605,6 +609,7 @@ __all__ = [
     "DEFAULT_MAX_SESSIONS",
     "OpenSshTransport",
     "ShellAttachment",
+    "SshAttachment",
     "SshSettings",
     "bridge_control_argv",
     "bridge_session_argv",
