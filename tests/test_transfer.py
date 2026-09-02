@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from pazuzu import cli
+from pazuzu.errors import CommandTimedOut
+from pazuzu.process import ProcessResult
 from pazuzu.transfer import copy_argv, rsync_argv, run_transfer
 from pazuzu.transport import SshAttachment
 
@@ -84,37 +89,49 @@ class TransferArgumentTests(unittest.TestCase):
 
 class TransferProcessTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_exit_code_is_returned(self) -> None:
-        process = mock.Mock(returncode=23)
-        process.wait = mock.AsyncMock(return_value=23)
-        spawn = mock.AsyncMock(return_value=process)
+        result = ProcessResult(23, b"out", b"err", False, False)
 
-        with mock.patch("pazuzu.transfer.asyncio.create_subprocess_exec", spawn):
-            result = await run_transfer(["/custom/scp", "source", "destination"])
+        with mock.patch("pazuzu.transfer.run_process", new=mock.AsyncMock(return_value=result)) as run:
+            actual = await run_transfer(["/custom/scp", "source", "destination"])
 
-        self.assertEqual(23, result)
-        spawn.assert_awaited_once_with("/custom/scp", "source", "destination")
+        self.assertEqual(result, actual)
+        run.assert_awaited_once_with(
+            ["/custom/scp", "source", "destination"],
+            stdin=b"",
+            timeout=600.0,
+            output_limit=1024 * 1024,
+        )
 
-    async def test_cancellation_terminates_the_native_client(self) -> None:
-        stopped = asyncio.Event()
-        process = mock.Mock(returncode=None)
+    async def test_stalled_transfer_is_bounded_and_not_replayed(self) -> None:
+        with mock.patch(
+            "pazuzu.transfer.run_process", new=mock.AsyncMock(side_effect=TimeoutError)
+        ) as run, self.assertRaises(CommandTimedOut):
+            await run_transfer(["/custom/scp", "source", "destination"], timeout=0.25)
+        run.assert_awaited_once()
 
-        async def wait() -> int:
-            await stopped.wait()
-            process.returncode = -15
-            return -15
-
-        process.wait = mock.AsyncMock(side_effect=wait)
-        process.terminate.side_effect = stopped.set
-        spawn = mock.AsyncMock(return_value=process)
-
-        with mock.patch("pazuzu.transfer.asyncio.create_subprocess_exec", spawn):
-            task = asyncio.create_task(run_transfer(["/custom/rsync"]))
-            await asyncio.sleep(0)
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
-
-        process.terminate.assert_called_once_with()
+    async def test_timeout_kills_the_transfer_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            child_pid_file = Path(directory) / "child.pid"
+            script = Path(directory) / "stalled.py"
+            script.write_text(
+                "import os, subprocess, sys, time\n"
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                "open(sys.argv[1], 'w').write(str(child.pid))\n"
+                "time.sleep(60)\n"
+            )
+            with self.assertRaises(CommandTimedOut):
+                await run_transfer(
+                    [sys.executable, str(script), str(child_pid_file)], timeout=0.2
+                )
+            child_pid = int(child_pid_file.read_text())
+            for _ in range(20):
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                self.fail("transfer child process survived process-group cleanup")
 
 
 class TransferCliTests(unittest.IsolatedAsyncioTestCase):
@@ -122,23 +139,26 @@ class TransferCliTests(unittest.IsolatedAsyncioTestCase):
         arguments = cli._parser().parse_args(
             ["cp", "--scp", "/custom/scp", "--", "local", ":/remote"]
         )
-        descriptor = attachment().as_dict()
-        gateway = mock.AsyncMock(return_value=descriptor)
-        transfer = mock.AsyncMock(return_value=17)
+        gateway = mock.AsyncMock(
+            return_value={
+                "exit_code": 17,
+                "stdout": "",
+                "stderr": "copy failed",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+        )
 
         with (
             mock.patch("pazuzu.cli.call_gateway", gateway),
-            mock.patch("pazuzu.cli.run_transfer", transfer),
         ):
             result = await cli._run(arguments)
 
         self.assertEqual(17, result)
-        gateway.assert_awaited_once_with(
-            arguments.socket, "connection_attachment", timeout=140.0
-        )
-        argv = transfer.await_args.args[0]
-        self.assertEqual("/custom/scp", argv[0])
-        self.assertEqual(["local", "example-host:/remote"], argv[-2:])
+        params = gateway.await_args.args[2]
+        self.assertEqual("cp", params["tool"])
+        self.assertEqual("/custom/scp", params["executable"])
+        self.assertEqual(["--", "local", ":/remote"], params["arguments"])
 
     async def test_rsync_parser_preserves_native_arguments(self) -> None:
         arguments = cli._parser().parse_args(

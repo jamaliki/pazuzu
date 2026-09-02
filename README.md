@@ -185,8 +185,8 @@ python3 inspect.py | pazuzu exec -- python3 -
 
 ### File transfer
 
-Copy and synchronize files through the gateway-owned ControlMaster without
-putting file bytes in Pazuzu's bounded JSON protocol:
+Copy and synchronize files through the gateway-owned ControlMaster. Transfers
+run under the gateway's session budget and have a bounded local deadline:
 
 ```bash
 # Upload and download one file. Use normal scp flags after `--`.
@@ -205,11 +205,17 @@ rejected so a transfer cannot silently open another connection or target a
 different host. Prefix a local filename containing a colon with `./` so it is
 unambiguously local.
 
-The native `scp` or `rsync` process owns the terminal and streams bytes directly
-through an independent channel on the existing SSH master. Pazuzu does not
-buffer file data, truncate it, or replay a transfer after a disconnect. Native
+The gateway owns the native `scp` or `rsync` process, bounds its output, and
+terminates the whole process group on cancellation or timeout (600 seconds by
+default; override with `--timeout`). It never replays a transfer after a
+disconnect because the destination may have been partially changed. Native
 exit codes are preserved; use rsync's `--partial` or other application-level
 recovery options when resumability is required.
+
+Pazuzu reserves one ControlMaster session for health probes and one additional
+session for the explicitly interactive `pazuzu shell` attachment, whose
+terminal bytes remain outside the gateway. Long-lived service bridges acquire
+their own crash-safe leases and cannot consume either reserved slot.
 
 ### Interactive shell
 

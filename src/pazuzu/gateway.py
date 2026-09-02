@@ -235,6 +235,8 @@ class GatewayServer:
             return (await self.supervisor.connection_attachment()).as_dict()
         if operation == "execute":
             return await self._execute(params)
+        if operation == "transfer":
+            return await self._transfer(params)
         raise ProtocolError(f"unknown gateway operation {operation!r}")
 
     async def _execute(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -258,6 +260,24 @@ class GatewayServer:
             raise TypeError("retry_safe must be a boolean")
         result = await self.supervisor.execute(
             command, stdin=stdin, timeout=float(timeout), retry_safe=retry_safe
+        )
+        return result.as_dict()
+
+    async def _transfer(self, params: dict[str, Any]) -> dict[str, Any]:
+        tool = params.get("tool")
+        executable = params.get("executable")
+        arguments = params.get("arguments")
+        timeout = params.get("timeout_seconds", 600.0)
+        if tool not in {"cp", "rsync"} or not isinstance(executable, str):
+            raise TypeError("invalid transfer parameters")
+        if not isinstance(arguments, list) or any(not isinstance(item, str) for item in arguments):
+            raise TypeError("transfer arguments must be a list of strings")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise TypeError("transfer timeout must be a number")
+        if not 0 < timeout <= 3600:
+            raise ValueError("transfer timeout must be between 0 and 3600")
+        result = await self.supervisor.transfer(
+            tool, arguments, executable=executable, timeout=float(timeout)
         )
         return result.as_dict()
 

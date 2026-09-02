@@ -27,7 +27,6 @@ from .launchd import (
 )
 from .shell import require_interactive_terminal, run_shell
 from .ssh import OpenSshSupervisor, SshSettings
-from .transfer import copy_argv, rsync_argv, run_transfer
 from .transport import DEFAULT_MAX_SESSIONS, SshAttachment, run_bridge
 
 
@@ -97,6 +96,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     copy.add_argument("--socket", type=_path, default=_socket_default())
     copy.add_argument("--scp", default=os.environ.get("PAZUZU_SCP", "/usr/bin/scp"))
+    copy.add_argument("--timeout", type=float, default=600.0)
     copy.add_argument("transfer_arguments", nargs=argparse.REMAINDER)
 
     rsync = subparsers.add_parser(
@@ -104,6 +104,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     rsync.add_argument("--socket", type=_path, default=_socket_default())
     rsync.add_argument("--rsync", default=os.environ.get("PAZUZU_RSYNC", "/usr/bin/rsync"))
+    rsync.add_argument("--timeout", type=float, default=600.0)
     rsync.add_argument("transfer_arguments", nargs=argparse.REMAINDER)
 
     service = subparsers.add_parser("service", help="manage auto-restarting macOS services")
@@ -247,23 +248,23 @@ async def _run(arguments: argparse.Namespace) -> int:
             stderr=sys.stderr,
         )
     if arguments.operation in {"cp", "rsync"}:
+        executable = arguments.scp if arguments.operation == "cp" else arguments.rsync
         result = await call_gateway(
-            arguments.socket, "connection_attachment", timeout=140.0
+            arguments.socket,
+            "transfer",
+            {
+                "tool": arguments.operation,
+                "executable": executable,
+                "arguments": arguments.transfer_arguments,
+                "timeout_seconds": arguments.timeout,
+            },
+            timeout=arguments.timeout + 30.0,
         )
-        attachment = SshAttachment.from_dict(result)
-        if arguments.operation == "cp":
-            argv = copy_argv(
-                attachment,
-                arguments.transfer_arguments,
-                executable=arguments.scp,
-            )
-        else:
-            argv = rsync_argv(
-                attachment,
-                arguments.transfer_arguments,
-                executable=arguments.rsync,
-            )
-        return await run_transfer(argv)
+        sys.stdout.write(str(result.get("stdout", "")))
+        sys.stderr.write(str(result.get("stderr", "")))
+        if result.get("stdout_truncated") or result.get("stderr_truncated"):
+            print("pazuzu: transfer output was truncated", file=sys.stderr)
+        return int(result["exit_code"])
     raise AssertionError("unreachable operation")
 
 

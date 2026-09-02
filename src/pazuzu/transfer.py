@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import re
 import shlex
 from collections.abc import Sequence
 
+from .errors import CommandTimedOut, ConnectionUnavailable
+from .process import ProcessResult, run_process
 from .transport import SshAttachment
 
 _REMOTE_SPEC = re.compile(r"^[^/][^:]*:")
@@ -112,29 +112,21 @@ def rsync_argv(
     ]
 
 
-async def _terminate(process: asyncio.subprocess.Process) -> None:
-    if process.returncode is not None:
-        return
-    with contextlib.suppress(ProcessLookupError):
-        process.terminate()
+async def run_transfer(
+    argv: Sequence[str], *, timeout: float = 600.0, output_limit: int = 1024 * 1024
+) -> ProcessResult:
+    """Run one transfer with a deadline and whole-process-group cleanup."""
+
+    if timeout <= 0:
+        raise ValueError("transfer timeout must be positive")
     try:
-        await asyncio.wait_for(process.wait(), 2.0)
-    except TimeoutError:
-        with contextlib.suppress(ProcessLookupError):
-            process.kill()
-        await process.wait()
-
-
-async def run_transfer(argv: Sequence[str]) -> int:
-    """Run a native transfer on the caller's terminal without buffering its bytes."""
-
-    process = await asyncio.create_subprocess_exec(*argv)
-    try:
-        returncode = await process.wait()
-    except asyncio.CancelledError:
-        await _terminate(process)
-        raise
-    return 128 - returncode if returncode < 0 else returncode
+        return await run_process(
+            list(argv), stdin=b"", timeout=timeout, output_limit=output_limit
+        )
+    except TimeoutError as exc:
+        raise CommandTimedOut(f"file transfer exceeded its {timeout:g}s deadline") from exc
+    except OSError as exc:
+        raise ConnectionUnavailable(f"could not launch file transfer: {exc}") from exc
 
 
 __all__ = ["copy_argv", "rsync_argv", "run_transfer"]

@@ -4,13 +4,17 @@ import asyncio
 import json
 import os
 import signal
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from pazuzu.cli import _parser
 from pazuzu.errors import CommandTimedOut, ConnectionUnavailable, UncertainExecution
+from pazuzu.lease import SessionLeasePool
 from pazuzu.process import ProcessResult
 from pazuzu.ssh import OpenSshSupervisor, SshSettings, classify_connection_failure
 
@@ -22,6 +26,48 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(6, settings.max_sessions)
         self.assertEqual(settings.max_sessions, arguments.max_sessions)
+
+    def test_external_bridge_leases_cannot_consume_health_slot(self) -> None:
+        directory = self.root / "sessions"
+        bridge_pool = SessionLeasePool(directory, 4)
+        health_pool = SessionLeasePool(directory, 1, start_slot=5)
+        leases = [bridge_pool.acquire() for _ in range(4)]
+        health = health_pool.acquire(timeout=0.1)
+        health.release()
+        for lease in leases:
+            lease.release()
+
+    def test_session_lease_is_released_by_a_crashed_process(self) -> None:
+        directory = self.root / "sessions"
+        marker = self.root / "acquired"
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import pathlib, sys, time; "
+                    "from pazuzu.lease import SessionLeasePool; "
+                    "lease=SessionLeasePool(pathlib.Path(sys.argv[1]), 1).acquire(); "
+                    "pathlib.Path(sys.argv[2]).touch(); time.sleep(60)"
+                ),
+                str(directory),
+                str(marker),
+            ]
+        )
+        try:
+            for _ in range(100):
+                if marker.exists():
+                    break
+                time.sleep(0.01)
+            self.assertTrue(marker.exists())
+            child.kill()
+            child.wait(timeout=2)
+            lease = SessionLeasePool(directory, 1).acquire(timeout=0.5)
+            lease.release()
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
 
     def test_browser_authorization_wait_is_authentication_required(self) -> None:
         self.assertEqual(
@@ -174,6 +220,41 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(probe_started.is_set())
         self.assertTrue(status["session_healthy"])
 
+    async def test_failed_probe_waits_for_active_operation_before_repair(self) -> None:
+        supervisor = self.supervisor(max_sessions=2)
+        supervisor._state = "connected"
+        supervisor._generation = 1
+        command_started = asyncio.Event()
+        release_command = asyncio.Event()
+        repair_started = asyncio.Event()
+
+        async def session(command: str, *, stdin: bytes = b"", timeout: float) -> ProcessResult:
+            del stdin, timeout
+            if command == "held-command":
+                command_started.set()
+                await release_command.wait()
+            else:
+                repair_started.set()
+                raise CommandTimedOut("probe stalled")
+            return ProcessResult(0, b"", b"", False, False)
+
+        with (
+            mock.patch.object(
+                supervisor.transport, "control_check", new=mock.AsyncMock(return_value=True)
+            ),
+            mock.patch.object(supervisor.transport, "session", side_effect=session),
+            mock.patch.object(supervisor.transport, "stop_master", new=mock.AsyncMock()),
+            mock.patch.object(supervisor.transport, "start_master", new=mock.AsyncMock()),
+        ):
+            command = asyncio.create_task(supervisor.execute("held-command"))
+            await command_started.wait()
+            repair = asyncio.create_task(supervisor._repair_if_broken(1))
+            await repair_started.wait()
+            await asyncio.sleep(0.05)
+            self.assertFalse(repair.done())
+            release_command.set()
+            await asyncio.wait_for(asyncio.gather(command, repair), 1)
+
     async def test_attachment_replaces_a_master_whose_probe_times_out(self) -> None:
         supervisor = self.supervisor()
         supervisor._state = "connected"
@@ -223,6 +304,21 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("authentication required", unavailable["last_error"])
         self.assertEqual("connected", connected["connection"])
         self.assertEqual("ran:after-login\n", result.stdout)
+
+    async def test_master_logs_are_preserved_per_generation(self) -> None:
+        self.update_state(offline=True)
+        supervisor = self.supervisor()
+        try:
+            with self.assertRaises(ConnectionUnavailable):
+                await supervisor.execute("before-login")
+            self.update_state(offline=False)
+            await supervisor.reconnect()
+        finally:
+            await supervisor.close()
+
+        logs = sorted(self.root.glob("ssh.ctl.g*.log"))
+        self.assertGreaterEqual(len(logs), 2)
+        self.assertEqual(len(logs), len({log.name for log in logs}))
 
     async def test_close_kills_master_waiting_for_browser_auth(self) -> None:
         self.update_state(auth_wait=True)

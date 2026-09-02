@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import CommandTimedOut, ConnectionUnavailable
+from .lease import SessionLeasePool, session_lease_directory
 from .process import ProcessResult, run_process
 
 DEFAULT_MAX_SESSIONS = 6
@@ -183,13 +184,25 @@ class OpenSshTransport:
         self.settings = settings
         self._master: subprocess.Popen[bytes] | None = None
         self._master_log: Any | None = None
+        self._master_log_path: Path | None = None
+        self._start_count = 0
+        self.session_leases = SessionLeasePool(
+            session_lease_directory(settings.control_path), max(1, settings.max_sessions - 2)
+        )
+        self.health_leases = SessionLeasePool(
+            session_lease_directory(settings.control_path), 1, start_slot=settings.max_sessions - 1
+        )
 
     async def start_master(self) -> None:
         control_path = self.settings.control_path
         control_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         control_path.unlink(missing_ok=True)
-        log_path = control_path.with_suffix(control_path.suffix + ".log")
-        self._master_log = log_path.open("wb")
+        self._start_count += 1
+        log_path = control_path.with_suffix(
+            control_path.suffix + f".g{self._start_count}.{os.getpid()}.{time.time_ns()}.log"
+        )
+        self._master_log_path = log_path
+        self._master_log = log_path.open("ab")
         try:
             self._master = await asyncio.to_thread(
                 _spawn_master, self._master_argv(), self._master_log
@@ -225,6 +238,7 @@ class OpenSshTransport:
         if self._master_log is not None:
             self._master_log.close()
             self._master_log = None
+        self._master_log_path = None
         self.settings.control_path.unlink(missing_ok=True)
         _master_owner_file(self.settings.control_path).unlink(missing_ok=True)
 
@@ -376,7 +390,12 @@ class OpenSshTransport:
         ]
 
     def _master_error(self, prefix: str) -> str:
-        log_path = self.settings.control_path.with_suffix(self.settings.control_path.suffix + ".log")
+        log_path = self._master_log_path
+        if log_path is None:
+            log_path = self.settings.control_path.with_suffix(
+                self.settings.control_path.suffix
+                + f".g{self._start_count}.{os.getpid()}.{time.time_ns()}.log"
+            )
         detail = ""
         with contextlib.suppress(OSError):
             detail = log_path.read_bytes()[-8000:].decode(errors="replace").strip()
@@ -552,6 +571,12 @@ def run_bridge(
         signum: signal.signal(signum, relay_signal)
         for signum in (signal.SIGINT, signal.SIGTERM)
     }
+    # Bridges are long-lived external clients of the master.  Hold one shared
+    # lease for their lifetime and exclude the final slot, reserved for health.
+    bridge_pool = SessionLeasePool(
+        session_lease_directory(settings.control_path), max(1, settings.max_sessions - 2)
+    )
+    bridge_lease = bridge_pool.acquire()
     try:
         # A SIGKILL may have prevented a previous instance from cleaning up.
         _control_bridge(cancel_argv, required=False)
@@ -601,6 +626,7 @@ def run_bridge(
     finally:
         if forward_registered:
             _control_bridge(cancel_argv, required=False)
+        bridge_lease.release()
         for signum, handler in previous.items():
             signal.signal(signum, handler)
 
