@@ -67,10 +67,11 @@ class OpenSshSupervisor:
         self._lock = asyncio.Lock()
         self._activity = asyncio.Condition()
         self._active_operations = 0
-        # Keep one local slot available for a health probe/reconnect.  Bridges
-        # use the same cross-process pool, so they cannot consume this headroom
-        # invisibly while a gateway probe is trying to diagnose the master.
-        self._sessions = asyncio.Semaphore(max(1, settings.max_sessions - 2))
+        # Tokyo exposes one transient session beyond the long-lived bridges.
+        # Serialize transient operations so health can never overlap a
+        # transfer/command and mistake capacity pressure for master failure.
+        self._sessions = asyncio.Semaphore(1)
+        self._transient_gate = asyncio.Lock()
         self._wake = asyncio.Event()
         self._maintainer: asyncio.Task[None] | None = None
         self._closed = False
@@ -118,9 +119,10 @@ class OpenSshSupervisor:
             raise ValueError("remote command must be a non-empty string without NUL bytes")
         if timeout <= 0:
             raise ValueError("command timeout must be positive")
-        async with self._sessions, self._session_lease():
+        async with self._sessions:
             generation = await self._ensure_connected()
-            async with self._operation_activity():
+            async with self._session_lease(), self._operation_activity():
+                generation = self._generation
                 result = await self.transport.session(command, stdin=stdin, timeout=timeout)
         # A failed command must release its slot before the repair probe reserves one.
         if result.exit_code != 255:
@@ -181,20 +183,21 @@ class OpenSshSupervisor:
             raise ValueError("transfer executable must be non-empty and contain no NUL bytes")
         if timeout <= 0:
             raise ValueError("transfer timeout must be positive")
-        async with self._sessions, self._session_lease():
+        async with self._sessions:
             generation = await self._ensure_connected()
-            attachment = SshAttachment(
-                host=self.settings.host,
-                ssh_binary=self.settings.ssh_binary,
-                control_path=self.settings.control_path,
-                generation=generation,
-            )
-            argv = (
-                copy_argv(attachment, arguments, executable=executable)
-                if tool == "cp"
-                else rsync_argv(attachment, arguments, executable=executable)
-            )
-            async with self._operation_activity():
+            async with self._session_lease(), self._operation_activity():
+                generation = self._generation
+                attachment = SshAttachment(
+                    host=self.settings.host,
+                    ssh_binary=self.settings.ssh_binary,
+                    control_path=self.settings.control_path,
+                    generation=generation,
+                )
+                argv = (
+                    copy_argv(attachment, arguments, executable=executable)
+                    if tool == "cp"
+                    else rsync_argv(attachment, arguments, executable=executable)
+                )
                 result = await run_transfer(
                     argv, timeout=timeout, output_limit=self.settings.max_output_bytes
                 )
@@ -204,19 +207,21 @@ class OpenSshSupervisor:
 
     @contextlib.asynccontextmanager
     async def _session_lease(self):
-        lease = await self.transport.session_leases.acquire_async()
-        try:
-            yield lease
-        finally:
-            lease.release()
+        async with self._transient_gate:
+            lease = await self.transport.session_leases.acquire_async()
+            try:
+                yield lease
+            finally:
+                lease.release()
 
     @contextlib.asynccontextmanager
     async def _health_lease(self):
-        lease = await self.transport.health_leases.acquire_async()
-        try:
-            yield lease
-        finally:
-            lease.release()
+        async with self._transient_gate:
+            lease = await self.transport.health_leases.acquire_async()
+            try:
+                yield lease
+            finally:
+                lease.release()
 
     @contextlib.asynccontextmanager
     async def _operation_activity(self):
@@ -369,9 +374,10 @@ class OpenSshSupervisor:
             return True
 
     async def _replay_once(self, command: str, stdin: bytes, timeout: float) -> CommandResult:
-        async with self._sessions, self._session_lease():
+        async with self._sessions:
             generation = await self._ensure_connected()
-            async with self._operation_activity():
+            async with self._session_lease(), self._operation_activity():
+                generation = self._generation
                 replay = await self.transport.session(command, stdin=stdin, timeout=timeout)
         if replay.exit_code == 255 and await self._repair_if_broken(generation):
             raise ConnectionUnavailable(
