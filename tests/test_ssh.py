@@ -27,13 +27,15 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(6, settings.max_sessions)
         self.assertEqual(settings.max_sessions, arguments.max_sessions)
 
-    def test_external_bridge_leases_cannot_consume_health_slot(self) -> None:
+    def test_three_bridges_leave_one_transient_capacity_slot(self) -> None:
         directory = self.root / "sessions"
-        bridge_pool = SessionLeasePool(directory, 4)
-        health_pool = SessionLeasePool(directory, 1, start_slot=5)
-        leases = [bridge_pool.acquire() for _ in range(4)]
-        health = health_pool.acquire(timeout=0.1)
-        health.release()
+        bridge_pool = SessionLeasePool(directory, 3)
+        transient_pool = SessionLeasePool(directory, 1, start_slot=3)
+        leases = [bridge_pool.acquire() for _ in range(3)]
+        transient = transient_pool.acquire(timeout=0.1)
+        with self.assertRaises(TimeoutError):
+            transient_pool.acquire(timeout=0.05)
+        transient.release()
         for lease in leases:
             lease.release()
 
@@ -249,11 +251,61 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             command = asyncio.create_task(supervisor.execute("held-command"))
             await command_started.wait()
             repair = asyncio.create_task(supervisor._repair_if_broken(1))
-            await repair_started.wait()
             await asyncio.sleep(0.05)
             self.assertFalse(repair.done())
+            self.assertFalse(repair_started.is_set())
             release_command.set()
+            await repair_started.wait()
             await asyncio.wait_for(asyncio.gather(command, repair), 1)
+
+    async def test_three_bridges_serialize_transient_transfer_and_health_probe(self) -> None:
+        supervisor = self.supervisor()
+        supervisor._state = "connected"
+        supervisor._generation = 1
+        bridge_leases = [SessionLeasePool(supervisor.transport.session_leases.directory, 3).acquire()
+                         for _ in range(3)]
+        transfer_started = asyncio.Event()
+        release_transfer = asyncio.Event()
+        probe_started = asyncio.Event()
+
+        async def transfer(*_args: object, **_kwargs: object) -> ProcessResult:
+            transfer_started.set()
+            await release_transfer.wait()
+            return ProcessResult(0, b"", b"", False, False)
+
+        async def session(command: str, *, stdin: bytes = b"", timeout: float) -> ProcessResult:
+            del stdin, timeout
+            if command == "true":
+                probe_started.set()
+            return ProcessResult(0, b"", b"", False, False)
+
+        try:
+            with (
+                mock.patch.object(
+                    supervisor.transport, "control_check", new=mock.AsyncMock(return_value=True)
+                ),
+                mock.patch("pazuzu.supervisor.run_transfer", side_effect=transfer),
+                mock.patch.object(supervisor.transport, "session", side_effect=session),
+            ):
+                copy = asyncio.create_task(
+                    supervisor.transfer(
+                        "cp", ["--", "local", ":remote"], executable="/usr/bin/scp", timeout=1
+                    )
+                )
+                await transfer_started.wait()
+                health = asyncio.create_task(supervisor.health(probe=True))
+                await asyncio.sleep(0.05)
+                self.assertFalse(probe_started.is_set())
+                release_transfer.set()
+                result, status = await asyncio.wait_for(asyncio.gather(copy, health), 1)
+        finally:
+            for lease in bridge_leases:
+                lease.release()
+            await supervisor.close()
+
+        self.assertEqual(0, result.exit_code)
+        self.assertTrue(status["session_healthy"])
+        self.assertTrue(probe_started.is_set())
 
     async def test_attachment_replaces_a_master_whose_probe_times_out(self) -> None:
         supervisor = self.supervisor()

@@ -186,12 +186,16 @@ class OpenSshTransport:
         self._master_log: Any | None = None
         self._master_log_path: Path | None = None
         self._start_count = 0
+        # Leave one slot for a transient gateway operation and one for an
+        # interactive shell attachment outside the gateway.  Bridges consume
+        # only the remaining slots, so remote MaxSessions pressure cannot make
+        # health and a transfer compete with one another.
         self.session_leases = SessionLeasePool(
-            session_lease_directory(settings.control_path), max(1, settings.max_sessions - 2)
+            session_lease_directory(settings.control_path),
+            1,
+            start_slot=max(0, settings.max_sessions - 3),
         )
-        self.health_leases = SessionLeasePool(
-            session_lease_directory(settings.control_path), 1, start_slot=settings.max_sessions - 1
-        )
+        self.health_leases = self.session_leases
 
     async def start_master(self) -> None:
         control_path = self.settings.control_path
@@ -574,7 +578,7 @@ def run_bridge(
     # Bridges are long-lived external clients of the master.  Hold one shared
     # lease for their lifetime and exclude the final slot, reserved for health.
     bridge_pool = SessionLeasePool(
-        session_lease_directory(settings.control_path), max(1, settings.max_sessions - 2)
+        session_lease_directory(settings.control_path), max(1, settings.max_sessions - 3)
     )
     bridge_lease = bridge_pool.acquire()
     try:

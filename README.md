@@ -212,10 +212,12 @@ disconnect because the destination may have been partially changed. Native
 exit codes are preserved; use rsync's `--partial` or other application-level
 recovery options when resumability is required.
 
-Pazuzu reserves one ControlMaster session for health probes and one additional
-session for the explicitly interactive `pazuzu shell` attachment, whose
-terminal bytes remain outside the gateway. Long-lived service bridges acquire
-their own crash-safe leases and cannot consume either reserved slot.
+Pazuzu reserves one transient ControlMaster session for gateway operations and
+health probes, and serializes those users so a probe cannot overlap a transfer
+under a constrained remote `MaxSessions`. One additional session is left for
+the explicitly interactive `pazuzu shell` attachment, whose terminal bytes
+remain outside the gateway. Long-lived service bridges acquire their own
+crash-safe leases and cannot consume the transient or shell-slack slots.
 
 ### Interactive shell
 
