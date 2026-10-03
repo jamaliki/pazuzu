@@ -56,6 +56,13 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--max-sessions", type=int, default=DEFAULT_MAX_SESSIONS)
     serve.add_argument("--connect-timeout", type=float, default=60.0)
     serve.add_argument("--probe-interval", type=float, default=60.0)
+    serve.add_argument("--probe-timeout", type=float, default=30.0)
+    serve.add_argument(
+        "--probe-failures",
+        type=int,
+        default=3,
+        help="consecutive failed probes before a still-answering master is replaced",
+    )
 
     for name in ("status", "reconnect", "stop"):
         command = subparsers.add_parser(name)
@@ -138,6 +145,8 @@ async def _serve(arguments: argparse.Namespace) -> None:
         ssh_binary=arguments.ssh,
         connect_timeout=arguments.connect_timeout,
         probe_interval=arguments.probe_interval,
+        probe_timeout=arguments.probe_timeout,
+        probe_failures=arguments.probe_failures,
         max_sessions=arguments.max_sessions,
     )
     gateway = GatewayServer(OpenSshSupervisor(settings), arguments.socket)

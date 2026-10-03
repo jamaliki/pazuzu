@@ -137,6 +137,10 @@ def run_master(control_path: Path) -> int:
 
 def run_session(command: str) -> int:
     state = read_state()
+    if command == "true" and int(state.get("slow_probes", 0)) > 0:
+        # A busy login host: the session opens, but only after a long delay.
+        update_state(lambda current: current.update(slow_probes=int(current["slow_probes"]) - 1))
+        time.sleep(float(state.get("slow_seconds", 1.0)))
     update_state(
         lambda current: current.setdefault("events", []).append(
             ["session", command, bool(state.get("healthy", False))]

@@ -155,8 +155,12 @@ class SshSettings:
     control_path: Path
     ssh_binary: str = "/usr/bin/ssh"
     connect_timeout: float = 60.0
-    probe_timeout: float = 10.0
+    # A busy login host can take tens of seconds to start a session while the
+    # encrypted connection itself is fine, so a probe gets generous time and a
+    # live master is replaced only after several consecutive failures.
+    probe_timeout: float = 30.0
     probe_interval: float = 60.0
+    probe_failures: int = 3
     keepalive_interval: int = 15
     keepalive_count: int = 3
     connection_attempts: int = 2
@@ -170,6 +174,8 @@ class SshSettings:
             raise ValueError("max_sessions must be between 1 and 64")
         if not 1 <= self.connection_attempts <= 5:
             raise ValueError("connection_attempts must be between 1 and 5")
+        if not 1 <= self.probe_failures <= 10:
+            raise ValueError("probe_failures must be between 1 and 10")
         if min(self.connect_timeout, self.probe_timeout, self.probe_interval) <= 0:
             raise ValueError("SSH timeouts must be positive")
         if len(os.fsencode(self.control_path)) > 100:
@@ -293,7 +299,10 @@ class OpenSshTransport:
 
         if not await self.control_check():
             return False
-        probe = await self.session("true", timeout=self.settings.probe_timeout)
+        try:
+            probe = await self.session("true", timeout=self.settings.probe_timeout)
+        except CommandTimedOut:
+            return False
         return probe.exit_code == 0
 
     async def control_check(self) -> bool:
@@ -345,15 +354,28 @@ class OpenSshTransport:
 
     async def _wait_until_ready(self) -> None:
         deadline = time.monotonic() + self.settings.connect_timeout + 5.0
-        while time.monotonic() < deadline:
-            if self._master is not None and self._master.poll() is not None:
-                raise ConnectionUnavailable(self._master_error("SSH master exited"))
-            if await self.control_check():
+        while not await self.control_check():
+            self._raise_if_master_exited()
+            if time.monotonic() >= deadline:
+                raise ConnectionUnavailable(self._master_error("SSH master startup timed out"))
+            await asyncio.sleep(0.1)
+        # The master has authenticated. A slow first session on a busy host is
+        # retried instead of discarding the connection and authenticating again.
+        failure = "session probe failed"
+        for _ in range(self.settings.probe_failures):
+            self._raise_if_master_exited()
+            try:
                 if await self.probe():
                     return
-                raise ConnectionUnavailable(self._master_error("session probe failed"))
-            await asyncio.sleep(0.1)
-        raise ConnectionUnavailable(self._master_error("SSH master startup timed out"))
+            except CommandTimedOut as exc:
+                failure = f"session probe failed: {exc}"
+                continue
+            break
+        raise ConnectionUnavailable(self._master_error(failure))
+
+    def _raise_if_master_exited(self) -> None:
+        if self._master is not None and self._master.poll() is not None:
+            raise ConnectionUnavailable(self._master_error("SSH master exited"))
 
     async def _control_command(self, operation: str) -> ProcessResult:
         argv = [
