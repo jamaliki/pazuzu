@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -307,37 +308,118 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(status["session_healthy"])
         self.assertTrue(probe_started.is_set())
 
-    async def test_attachment_replaces_a_master_whose_probe_times_out(self) -> None:
+    @contextlib.contextmanager
+    def mocked_master(self, session, control_check=True):
         supervisor = self.supervisor()
         supervisor._state = "connected"
         supervisor._generation = 1
-
+        check = (
+            mock.AsyncMock(side_effect=control_check)
+            if isinstance(control_check, list)
+            else mock.AsyncMock(return_value=control_check)
+        )
         with (
+            mock.patch.object(supervisor.transport, "control_check", new=check),
             mock.patch.object(
-                supervisor.transport,
-                "control_check",
-                new=mock.AsyncMock(return_value=True),
+                supervisor.transport, "session", new=mock.AsyncMock(side_effect=session)
             ),
-            mock.patch.object(
-                supervisor.transport,
-                "session",
-                new=mock.AsyncMock(side_effect=CommandTimedOut("probe timed out")),
-            ),
-            mock.patch.object(
-                supervisor.transport,
-                "stop_master",
-                new=mock.AsyncMock(),
-            ),
-            mock.patch.object(
-                supervisor.transport,
-                "start_master",
-                new=mock.AsyncMock(),
-            ),
+            mock.patch.object(supervisor.transport, "stop_master", new=mock.AsyncMock()),
+            mock.patch.object(supervisor.transport, "start_master", new=mock.AsyncMock()),
         ):
+            yield supervisor
+
+    async def test_slow_probes_keep_a_live_master_until_consecutive_failures(self) -> None:
+        with self.mocked_master(CommandTimedOut("probe timed out")) as supervisor:
+            generations, failures = [], []
+            for _ in range(3):
+                generations.append((await supervisor.connection_attachment()).generation)
+                failures.append((await supervisor.health())["probe_failures"])
+
+        self.assertEqual([1, 1, 2], generations)
+        self.assertEqual([1, 2, 0], failures)
+        self.assertEqual("connected", (await supervisor.health())["connection"])
+
+    async def test_a_successful_probe_clears_slow_probe_failures(self) -> None:
+        ok = ProcessResult(0, b"", b"", False, False)
+        slow = CommandTimedOut("probe timed out")
+        with self.mocked_master([slow, ok, slow, ok]) as supervisor:
+            for _ in range(4):
+                current = await supervisor.connection_attachment()
+            health = await supervisor.health(probe=False)
+
+        self.assertEqual(1, current.generation)
+        self.assertEqual(0, health["probe_failures"])
+        self.assertIsNotNone(health["last_probe_seconds"])
+
+    async def test_slow_probe_on_a_master_that_stopped_answering_replaces_it(self) -> None:
+        with self.mocked_master(
+            CommandTimedOut("probe timed out"), control_check=[True, False]
+        ) as supervisor:
             current = await supervisor.connection_attachment()
 
         self.assertEqual(2, current.generation)
-        self.assertEqual("connected", (await supervisor.health())["connection"])
+
+    async def test_refused_probe_on_a_live_master_replaces_it_at_once(self) -> None:
+        refused = ProcessResult(255, b"", b"mux_client_request_session: failed", False, False)
+        with self.mocked_master([refused]) as supervisor:
+            current = await supervisor.connection_attachment()
+
+        self.assertEqual(2, current.generation)
+
+    async def test_new_master_survives_a_slow_first_session(self) -> None:
+        self.update_state(slow_probes=1, slow_seconds=1.0)
+        supervisor = self.supervisor(probe_timeout=0.3)
+        try:
+            result = await supervisor.execute("after-slow-login")
+        finally:
+            await supervisor.close()
+
+        self.assertEqual("ran:after-slow-login\n", result.stdout)
+        self.assertEqual(1, self.read_state()["master_starts"])
+
+    async def test_slow_reconnect_is_recorded_and_maintenance_survives(self) -> None:
+        self.update_state(slow_probes=100, slow_seconds=1.0)
+        supervisor = self.supervisor(probe_timeout=0.2, probe_failures=2)
+        await supervisor.start()
+        try:
+            for _ in range(200):
+                health = await supervisor.health()
+                if health["consecutive_failures"]:
+                    break
+                await asyncio.sleep(0.02)
+            self.assertEqual("offline", health["connection"])
+            self.assertIn("session probe failed", health["last_error"])
+            self.assertFalse(supervisor.maintenance.done())
+
+            self.update_state(slow_probes=0)
+            connected = await supervisor.reconnect()
+        finally:
+            await supervisor.close()
+
+        self.assertEqual("connected", connected["connection"])
+
+    async def test_background_probe_tolerates_one_slow_session(self) -> None:
+        supervisor = self.supervisor(probe_interval=0.05, probe_timeout=0.3)
+        await supervisor.start()
+        try:
+            for _ in range(100):
+                if (await supervisor.health())["connection"] == "connected":
+                    break
+                await asyncio.sleep(0.02)
+            self.update_state(slow_probes=1, slow_seconds=1.0)
+            saw_failure = False
+            for _ in range(200):
+                health = await supervisor.health()
+                saw_failure = saw_failure or health["probe_failures"] == 1
+                if saw_failure and health["probe_failures"] == 0:
+                    break
+                await asyncio.sleep(0.02)
+        finally:
+            await supervisor.close()
+
+        self.assertTrue(saw_failure)
+        self.assertEqual(0, health["probe_failures"])
+        self.assertEqual(1, self.read_state()["master_starts"])
 
     async def test_authentication_state_survives_and_manual_reconnects(self) -> None:
         self.update_state(auth_required=True)

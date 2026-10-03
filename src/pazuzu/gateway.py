@@ -145,7 +145,17 @@ class GatewayServer:
         await self.supervisor.start()
         try:
             async with server:
-                await self.stop_event.wait()
+                stop = asyncio.create_task(self.stop_event.wait())
+                maintenance = self.supervisor.maintenance
+                watched = {stop} if maintenance is None else {stop, maintenance}
+                done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
+                if stop not in done:
+                    # Without maintenance the gateway would answer while nothing
+                    # keeps SSH alive; exit loudly so the service manager restarts
+                    # it and the replacement adopts the surviving master.
+                    stop.cancel()
+                    maintenance.result()
+                    raise RuntimeError("SSH maintenance stopped unexpectedly")
         finally:
             server.close()
             await server.wait_closed()

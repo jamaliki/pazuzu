@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import tempfile
@@ -153,6 +154,30 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         recovered = await execute_via_gateway(self.socket_path, "after-cancel")
         self.assertEqual("ran:after-cancel\n", recovered["stdout"])
         self.assertEqual(1, self.state()["master_starts"])
+
+    async def test_gateway_exits_when_maintenance_dies(self) -> None:
+        settings = SshSettings(
+            host="test-host",
+            control_path=self.root / "other.ctl",
+            ssh_binary=str(Path(__file__).with_name("fake_ssh.py")),
+        )
+        supervisor = OpenSshSupervisor(settings)
+
+        async def broken() -> None:
+            raise ValueError("maintenance bug")
+
+        server = GatewayServer(supervisor, self.root / "other.sock")
+        with mock.patch.object(supervisor, "_maintain", new=broken):
+            serving = asyncio.create_task(server.serve())
+            done, _ = await asyncio.wait({serving}, timeout=1.0)
+            if not done:
+                server.request_stop()
+                with contextlib.suppress(Exception):
+                    await serving
+                self.fail("the gateway kept serving without SSH maintenance")
+        with self.assertRaisesRegex(ValueError, "maintenance bug"):
+            serving.result()
+        self.assertFalse((self.root / "other.sock").exists())
 
     async def test_auth_expiry_keeps_gateway_alive_and_recovers_after_login(self) -> None:
         await execute_via_gateway(self.socket_path, "before-expiry")

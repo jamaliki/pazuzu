@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from .errors import CommandTimedOut, ConnectionUnavailable, UncertainExecution
+from .errors import CommandTimedOut, ConnectionUnavailable, PazuzuError, UncertainExecution
 from .process import ProcessResult
 from .transfer import copy_argv, rsync_argv, run_transfer
 from .transport import OpenSshTransport, SshAttachment, SshSettings
@@ -83,6 +83,14 @@ class OpenSshSupervisor:
         self._last_error: str | None = None
         self._failures = 0
         self._next_attempt = 0.0
+        self._probe_failures = 0
+        self._last_probe_seconds: float | None = None
+
+    @property
+    def maintenance(self) -> asyncio.Task[None] | None:
+        """The background maintenance task, which runs until ``close``."""
+
+        return self._maintainer
 
     async def start(self) -> None:
         """Start proactive connection maintenance without blocking local startup."""
@@ -127,13 +135,12 @@ class OpenSshSupervisor:
         # A failed command must release its slot before the repair probe reserves one.
         if result.exit_code != 255:
             return self._command_result(result, generation)
-        repaired = await self._safe_repair_after_command(generation)
-        if not repaired:
+        if not await self._safe_repair_after_command(generation):
             return self._command_result(result, generation)
         if not retry_safe:
             raise UncertainExecution(
-                "SSH disconnected after the remote command may have started; "
-                "the connection was repaired, but the command was not replayed"
+                "SSH lost the command channel after the remote command may have started; "
+                "the command was not replayed"
             )
         return await self._replay_once(command, stdin, timeout)
 
@@ -253,7 +260,7 @@ class OpenSshSupervisor:
                 await self._repair_if_broken(self._generation)
             except ConnectionUnavailable:
                 pass
-            session_healthy = self._state == "connected"
+            session_healthy = self._state == "connected" and not self._probe_failures
         retry_in = max(0.0, self._next_attempt - time.monotonic())
         return {
             "gateway": "running" if not self._closed else "stopped",
@@ -266,6 +273,8 @@ class OpenSshSupervisor:
             "last_failure_at": self._last_failure_at,
             "last_error": self._last_error,
             "consecutive_failures": self._failures,
+            "probe_failures": self._probe_failures,
+            "last_probe_seconds": self._last_probe_seconds,
             "retry_in_seconds": round(retry_in, 1),
         }
 
@@ -275,9 +284,13 @@ class OpenSshSupervisor:
                 await self._wake.wait()
                 self._wake.clear()
                 continue
-            delay = self.settings.probe_interval if self._state == "connected" else max(
-                0.0, self._next_attempt - time.monotonic()
-            )
+            if self._state != "connected":
+                delay = max(0.0, self._next_attempt - time.monotonic())
+            elif self._probe_failures:
+                # Confirm or clear a failed probe quickly instead of a minute later.
+                delay = min(self.settings.probe_interval, 10.0)
+            else:
+                delay = self.settings.probe_interval
             forced = await self._wait_for_wake(delay)
             if self._closed:
                 return
@@ -286,7 +299,9 @@ class OpenSshSupervisor:
                     await self._repair_if_broken(self._generation)
                 else:
                     await self._connect(force=forced)
-            except ConnectionUnavailable:
+            except PazuzuError:
+                # Failures are recorded in the connection state; maintenance must
+                # outlive every one of them.
                 pass
 
     async def _stop_maintenance(self) -> None:
@@ -337,7 +352,7 @@ class OpenSshSupervisor:
                 self._generation += 1
                 self._record_connected()
                 return
-            except ConnectionUnavailable as exc:
+            except (ConnectionUnavailable, CommandTimedOut) as exc:
                 errors.append(str(exc))
                 await self.transport.stop_master()
                 if classify_connection_failure(str(exc)) == "authentication_required":
@@ -349,8 +364,10 @@ class OpenSshSupervisor:
         raise ConnectionUnavailable(self._unavailable_message())
 
     async def _safe_repair_after_command(self, generation: int) -> bool:
+        """Whether a command's exit 255 came from the connection rather than the command."""
+
         try:
-            return await self._repair_if_broken(generation)
+            return await self._check(generation) != "healthy"
         except ConnectionUnavailable as exc:
             raise UncertainExecution(
                 "SSH disconnected after the remote command may have started, "
@@ -358,20 +375,52 @@ class OpenSshSupervisor:
             ) from exc
 
     async def _repair_if_broken(self, failed_generation: int) -> bool:
+        return await self._check(failed_generation) == "replaced"
+
+    async def _check(self, failed_generation: int) -> str:
+        """Probe the master: ``healthy``, ``degraded`` (kept), or ``replaced``.
+
+        A probe that times out while the master's control socket still answers
+        means a busy remote host: OpenSSH keepalives already guard the encrypted
+        connection, and replacing it would drop every bridge and in-flight
+        command and make that same host authenticate a new one. Such a master
+        is replaced only after ``probe_failures`` consecutive failures. A master
+        that refuses the session outright, or no longer answers, is replaced at
+        once.
+        """
+
         async with self._lock:
             if failed_generation != self._generation and self._state == "connected":
-                return True
+                return "replaced"
             async with self._health_lease():
-                try:
-                    healthy = await self.transport.probe()
-                except CommandTimedOut:
-                    healthy = False
-            if healthy:
-                self._last_success_at = _now()
-                return False
+                outcome = await self._probe()
+            if outcome == "ok":
+                return "healthy"
+            if (
+                outcome == "slow"
+                and self._probe_failures < self.settings.probe_failures
+                and await self.transport.control_check()
+            ):
+                return "degraded"
             await self._wait_for_idle_operations()
             await self._replace_master()
-            return True
+            return "replaced"
+
+    async def _probe(self) -> str:
+        """Run one session probe: ``ok``, ``slow`` (timed out), or ``failed``."""
+
+        started = time.monotonic()
+        try:
+            outcome = "ok" if await self.transport.probe() else "failed"
+        except CommandTimedOut:
+            outcome = "slow"
+        self._last_probe_seconds = round(time.monotonic() - started, 3)
+        if outcome == "ok":
+            self._probe_failures = 0
+            self._last_success_at = _now()
+        else:
+            self._probe_failures += 1
+        return outcome
 
     async def _replay_once(self, command: str, stdin: bytes, timeout: float) -> CommandResult:
         async with self._sessions:
@@ -379,7 +428,7 @@ class OpenSshSupervisor:
             async with self._session_lease(), self._operation_activity():
                 generation = self._generation
                 replay = await self.transport.session(command, stdin=stdin, timeout=timeout)
-        if replay.exit_code == 255 and await self._repair_if_broken(generation):
+        if replay.exit_code == 255 and await self._check(generation) != "healthy":
             raise ConnectionUnavailable(
                 "the idempotent command lost its connection again after one replay"
             )
@@ -393,6 +442,7 @@ class OpenSshSupervisor:
         self._last_error = None
         self._failures = 0
         self._next_attempt = 0.0
+        self._probe_failures = 0
 
     def _record_failure(self, detail: str) -> None:
         self._state = classify_connection_failure(detail)

@@ -120,8 +120,12 @@ return replayed=true or fail"]
 ```
 
 Exit code 255 is evidence, not a verdict. Pazuzu first checks whether the same
-master can still open a real session. It replaces the connection only after
-that probe fails, and replays only when the caller declared the operation safe.
+master can still open a real session. It replaces the connection when that
+probe is refused or the master stops answering, and replays only when the
+caller declared the operation safe. A probe that is merely slow while the master
+still answers points at a busy remote host rather than a broken connection, so
+it is counted instead: the connection is replaced only after three consecutive
+slow probes.
 Authentication failures leave the local gateway available but pause automatic
 attempts until the user reauthorizes and requests `pazuzu reconnect`.
 
@@ -247,6 +251,17 @@ OpenSSH probes the encrypted connection every 15 seconds, Pazuzu opens a real
 session once a minute, and a failed connection is retried with bounded backoff
 up to one minute. `pazuzu status --probe` distinguishes `connected`,
 `reconnecting`, `offline`, and `authentication_required`.
+
+Login hosts can take tens of seconds to start a session while the connection
+itself is fine. Replacing the master then would drop every bridge and command
+and make the same busy host authenticate a new connection, so a session probe
+gets 30 seconds, a slow one is rechecked after 10 seconds, and a master that
+still answers is replaced only after three consecutive slow probes. A newly
+authenticated master likewise survives a slow first session. `pazuzu status`
+reports `probe_failures` and `last_probe_seconds`; tune the policy with
+`pazuzu serve --probe-timeout` and `--probe-failures`. If connection
+maintenance ever stops, the gateway exits so its service manager restarts it
+and the replacement adopts the surviving master.
 
 The gateway admits six ordinary command sessions by default and health probes
 share that same budget. This leaves headroom under the common ten-session SSH
