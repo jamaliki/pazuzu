@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import signal
+import stat
 import sys
 from pathlib import Path
 
@@ -77,6 +78,12 @@ def _parser() -> argparse.ArgumentParser:
         "--retry-safe",
         action="store_true",
         help="allow one replay after repair; only for idempotent operations",
+    )
+    execute.add_argument(
+        "-n",
+        "--no-stdin",
+        action="store_true",
+        help="send no standard input, like ssh -n",
     )
     execute.add_argument("command", nargs=argparse.REMAINDER)
 
@@ -164,7 +171,10 @@ def _remote_command(arguments: list[str]) -> str:
 
 
 def _read_stdin() -> bytes:
-    if sys.stdin.isatty():
+    # A terminal, or a socket inherited from a supervisor or agent harness, is not
+    # input for the remote command, and a socket may never reach EOF. Pipes and file
+    # redirections are read to EOF.
+    if sys.stdin.isatty() or stat.S_ISSOCK(os.fstat(sys.stdin.fileno()).st_mode):
         return b""
     content = sys.stdin.buffer.read(4 * 1024 * 1024 + 1)
     if len(content) > 4 * 1024 * 1024:
@@ -227,7 +237,7 @@ async def _run(arguments: argparse.Namespace) -> int:
         result = await execute_via_gateway(
             arguments.socket,
             _remote_command(arguments.command),
-            stdin=_read_stdin(),
+            stdin=b"" if arguments.no_stdin else _read_stdin(),
             timeout=arguments.timeout,
             retry_safe=arguments.retry_safe,
         )
