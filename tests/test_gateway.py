@@ -155,6 +155,66 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("ran:after-cancel\n", recovered["stdout"])
         self.assertEqual(1, self.state()["master_starts"])
 
+    async def running_session_pid(self) -> int:
+        for _ in range(1000):
+            if self.state_path.exists() and self.state().get("session_pid"):
+                return int(self.state()["session_pid"])
+            await asyncio.sleep(0.01)
+        self.fail("the long-running session never started")
+
+    async def test_a_long_command_does_not_block_other_clients(self) -> None:
+        long = asyncio.create_task(execute_via_gateway(self.socket_path, "sleep", timeout=60))
+        session_pid = await self.running_session_pid()
+        try:
+            quick, status = await asyncio.wait_for(
+                asyncio.gather(
+                    execute_via_gateway(self.socket_path, "quick"),
+                    call_gateway(self.socket_path, "status", {"probe": True}),
+                ),
+                10,
+            )
+            self.assertFalse(long.done())
+            self.assertTrue(process_alive(session_pid))
+        finally:
+            long.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await long
+
+        self.assertEqual("ran:quick\n", quick["stdout"])
+        self.assertTrue(status["session_healthy"])
+        self.assertGreaterEqual(status["operations_active"], 1)
+
+    async def test_stop_does_not_wait_for_running_requests(self) -> None:
+        long = asyncio.create_task(execute_via_gateway(self.socket_path, "sleep", timeout=60))
+        session_pid = await self.running_session_pid()
+
+        self.server.request_stop()
+        await asyncio.wait_for(asyncio.shield(self.server_task), 10)
+
+        with self.assertRaises(PazuzuError):
+            await long
+        self.assertFalse(process_alive(session_pid))
+
+    async def test_requests_that_arrive_during_shutdown_are_refused(self) -> None:
+        self.server._closing = True
+
+        with self.assertRaises(PazuzuError):
+            await execute_via_gateway(self.socket_path, "after-shutdown-began")
+
+        events = self.state().get("events", []) if self.state_path.exists() else []
+        self.assertNotIn(["session", "after-shutdown-began", True], events)
+
+    async def test_reconnect_is_forced_only_on_request(self) -> None:
+        await execute_via_gateway(self.socket_path, "first")
+
+        kept = await call_gateway(self.socket_path, "reconnect")
+        forced = await call_gateway(self.socket_path, "reconnect", {"force": True})
+        with self.assertRaisesRegex(PazuzuError, "boolean"):
+            await call_gateway(self.socket_path, "reconnect", {"force": "yes"})
+
+        self.assertEqual(1, kept["generation"])
+        self.assertEqual(2, forced["generation"])
+
     async def test_gateway_exits_when_maintenance_dies(self) -> None:
         settings = SshSettings(
             host="test-host",

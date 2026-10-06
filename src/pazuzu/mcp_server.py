@@ -76,10 +76,14 @@ def create_server(
         return await client.health(probe=probe)
 
     @server.tool(name="reconnect")
-    async def reconnect() -> dict[str, Any]:
-        """Reconnect immediately, typically after completing interactive reauthorisation."""
+    async def reconnect(force: bool = False) -> dict[str, Any]:
+        """Repair the connection now, typically after completing interactive reauthorisation.
 
-        return await client.reconnect()
+        A healthy connection is kept so running commands, transfers, and bridges
+        survive. Set force only to replace a connection that is known to be bad.
+        """
+
+        return await client.reconnect(force=force)
 
     @server.tool(name="execute")
     async def execute(command: str, timeout_seconds: float = 120.0) -> dict[str, Any]:

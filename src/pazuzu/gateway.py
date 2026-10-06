@@ -124,6 +124,8 @@ class GatewayServer:
         self.socket_path = socket_path
         self.stop_event = asyncio.Event()
         self.preserve_master = False
+        self._clients: set[asyncio.Task[None]] = set()
+        self._closing = False
 
     def request_stop(self, preserve_master: bool = False) -> None:
         """Stop locally, optionally leaving SSH for a replacement gateway."""
@@ -144,20 +146,28 @@ class GatewayServer:
         self.socket_path.chmod(0o600)
         await self.supervisor.start()
         try:
-            async with server:
-                stop = asyncio.create_task(self.stop_event.wait())
-                maintenance = self.supervisor.maintenance
-                watched = {stop} if maintenance is None else {stop, maintenance}
-                done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
-                if stop not in done:
-                    # Without maintenance the gateway would answer while nothing
-                    # keeps SSH alive; exit loudly so the service manager restarts
-                    # it and the replacement adopts the surviving master.
-                    stop.cancel()
-                    maintenance.result()
-                    raise RuntimeError("SSH maintenance stopped unexpectedly")
+            stop = asyncio.create_task(self.stop_event.wait())
+            maintenance = self.supervisor.maintenance
+            watched = {stop} if maintenance is None else {stop, maintenance}
+            done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
+            if stop not in done:
+                # Without maintenance the gateway would answer while nothing
+                # keeps SSH alive; exit loudly so the service manager restarts
+                # it and the replacement adopts the surviving master.
+                stop.cancel()
+                maintenance.result()
+                raise RuntimeError("SSH maintenance stopped unexpectedly")
         finally:
+            # Set before any await: a connection accepted just before close()
+            # may start its handler after the cancellations below.
+            self._closing = True
             server.close()
+            # Stopping must not wait for long transfers: wait_closed() waits for
+            # every open request.  Cancelling a request terminates its process
+            # group, and nothing is ever replayed.
+            for client in list(self._clients):
+                client.cancel()
+            await asyncio.gather(*self._clients, return_exceptions=True)
             await server.wait_closed()
             if self.preserve_master:
                 await self.supervisor.detach()
@@ -184,7 +194,18 @@ class GatewayServer:
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        current = asyncio.current_task()
+        if current is not None:
+            self._clients.add(current)
+            current.add_done_callback(self._clients.discard)
+        if self._closing:
+            writer.close()
+            with contextlib.suppress(OSError):
+                await writer.wait_closed()
+            return
         request_id: Any = None
+        task: asyncio.Task[dict[str, Any]] | None = None
+        disconnected: asyncio.Task[bytes] | None = None
         try:
             request = _decode(await reader.readline())
             request_id = request.get("id")
@@ -204,6 +225,11 @@ class GatewayServer:
                     await disconnected
                 response = {"v": 1, "id": request_id, "ok": True, "result": task.result()}
         except asyncio.CancelledError:
+            # asyncio.wait does not cancel what it waits for; stop the request too.
+            pending = [item for item in (task, disconnected) if item is not None]
+            for item in pending:
+                item.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
             writer.close()
             with contextlib.suppress(OSError):
                 await writer.wait_closed()
@@ -235,7 +261,10 @@ class GatewayServer:
         if operation == "status":
             return await self.supervisor.health(probe=bool(params.get("probe", False)))
         if operation == "reconnect":
-            return await self.supervisor.reconnect()
+            force = params.get("force", False)
+            if not isinstance(force, bool):
+                raise TypeError("force must be a boolean")
+            return await self.supervisor.reconnect(force=force)
         if operation == "shutdown":
             asyncio.get_running_loop().call_soon(self.request_stop)
             return {"stopping": True}

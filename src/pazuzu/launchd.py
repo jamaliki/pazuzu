@@ -44,7 +44,17 @@ def _executable(name: str) -> Path:
     return candidate
 
 
-def _plist(label: str, arguments: list[str], log_name: str) -> dict[str, object]:
+def _plist(
+    label: str, arguments: list[str], log_name: str, *, process_type: str = "Standard"
+) -> dict[str, object]:
+    """Describe one agent.
+
+    The gateway and MCP adapter must not be ``Background``: macOS then marks
+    every socket they and their children open as background traffic, and TCP
+    switches to LEDBAT, a scavenger congestion controller that throttles the
+    shared SSH connection to a fraction of the link on a high-latency path.
+    """
+
     state_dir = default_state_dir()
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     state_dir.chmod(0o700)
@@ -53,7 +63,7 @@ def _plist(label: str, arguments: list[str], log_name: str) -> dict[str, object]
         "ProgramArguments": arguments,
         "RunAtLoad": True,
         "KeepAlive": True,
-        "ProcessType": "Background",
+        "ProcessType": process_type,
         "ThrottleInterval": 5,
         "Umask": 0o077,
         "StandardOutPath": str(state_dir / f"{log_name}.stdout.log"),
@@ -118,19 +128,7 @@ def _install(label: str, content: dict[str, object]) -> Path:
 
 
 def _configured_host() -> str | None:
-    target = _agent_path(GATEWAY_LABEL)
-    if not target.exists():
-        return None
-    try:
-        with target.open("rb") as handle:
-            content = plistlib.load(handle)
-    except (OSError, plistlib.InvalidFileException):
-        return None
-    arguments = content.get("ProgramArguments", [])
-    if not isinstance(arguments, list) or "--host" not in arguments:
-        return None
-    index = arguments.index("--host") + 1
-    return str(arguments[index]) if index < len(arguments) else None
+    return _option(_program_arguments(GATEWAY_LABEL), "--host")
 
 
 def _stop_detached_master(host: str | None) -> None:
@@ -156,7 +154,9 @@ def _stop_detached_master(host: str | None) -> None:
         )
 
 
-def install_services(host: str, *, mcp_port: int | None = None) -> list[Path]:
+def install_services(
+    host: str, *, mcp_port: int | None = None, max_sessions: int | None = None
+) -> list[Path]:
     """Install an auto-restarting gateway and optional MCP adapter."""
 
     if sys.platform != "darwin":
@@ -171,6 +171,8 @@ def install_services(host: str, *, mcp_port: int | None = None) -> list[Path]:
         "--control-path",
         str(default_control_path()),
     ]
+    if max_sessions is not None:
+        gateway_arguments += ["--max-sessions", str(max_sessions)]
     installed = [_install(GATEWAY_LABEL, _plist(GATEWAY_LABEL, gateway_arguments, "gateway"))]
     if mcp_port is not None:
         mcp_arguments = [
@@ -221,7 +223,11 @@ def install_bridge(
         "--",
         *remote_command,
     ]
-    return _install(label, _plist(label, arguments, f"bridge-{name}"))
+    # A bridge's own process only waits on its session; forwarded traffic is
+    # carried by the gateway's master, so the bridge can stay in the background.
+    return _install(
+        label, _plist(label, arguments, f"bridge-{name}", process_type="Background")
+    )
 
 
 def remove_bridge(name: str) -> Path | None:

@@ -54,7 +54,12 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--socket", type=_path, default=_socket_default())
     serve.add_argument("--control-path", type=_path, default=_control_default())
     serve.add_argument("--ssh", default=os.environ.get("PAZUZU_SSH", "/usr/bin/ssh"))
-    serve.add_argument("--max-sessions", type=int, default=DEFAULT_MAX_SESSIONS)
+    serve.add_argument(
+        "--max-sessions",
+        type=int,
+        default=DEFAULT_MAX_SESSIONS,
+        help="SSH channels Pazuzu may hold at once: bridges, commands, transfers, and probes",
+    )
     serve.add_argument("--connect-timeout", type=float, default=60.0)
     serve.add_argument("--probe-interval", type=float, default=60.0)
     serve.add_argument("--probe-timeout", type=float, default=30.0)
@@ -70,6 +75,12 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--socket", type=_path, default=_socket_default())
         if name == "status":
             command.add_argument("--probe", action="store_true")
+        if name == "reconnect":
+            command.add_argument(
+                "--force",
+                action="store_true",
+                help="replace the connection even when it is healthy; drops running work",
+            )
 
     execute = subparsers.add_parser("exec", help="run one command through the gateway")
     execute.add_argument("--socket", type=_path, default=_socket_default())
@@ -93,6 +104,7 @@ def _parser() -> argparse.ArgumentParser:
     bridge.add_argument("--host", default=os.environ.get("PAZUZU_HOST"), required=False)
     bridge.add_argument("--control-path", type=_path, default=_control_default())
     bridge.add_argument("--ssh", default=os.environ.get("PAZUZU_SSH", "/usr/bin/ssh"))
+    bridge.add_argument("--max-sessions", type=int, default=DEFAULT_MAX_SESSIONS)
     bridge.add_argument("--listen-host", default="127.0.0.1")
     bridge.add_argument("--listen-port", type=int, required=True)
     bridge.add_argument("--remote-host", default="127.0.0.1")
@@ -127,6 +139,7 @@ def _parser() -> argparse.ArgumentParser:
     install.add_argument("--host", default=os.environ.get("PAZUZU_HOST"), required=False)
     install.add_argument("--with-mcp", action="store_true")
     install.add_argument("--mcp-port", type=int, default=8767)
+    install.add_argument("--max-sessions", type=int, default=DEFAULT_MAX_SESSIONS)
     install_bridge_command = service_commands.add_parser(
         "install-bridge", help="install an auto-restarting generic service bridge"
     )
@@ -192,6 +205,7 @@ async def _run(arguments: argparse.Namespace) -> int:
             installed = install_services(
                 arguments.host,
                 mcp_port=arguments.mcp_port if arguments.with_mcp else None,
+                max_sessions=arguments.max_sessions,
             )
             print(json.dumps({"installed": [str(item) for item in installed]}, indent=2))
             return 0
@@ -226,7 +240,9 @@ async def _run(arguments: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if result.get("connection") == "connected" else 1
     if arguments.operation == "reconnect":
-        result = await call_gateway(arguments.socket, "reconnect", timeout=140.0)
+        result = await call_gateway(
+            arguments.socket, "reconnect", {"force": arguments.force}, timeout=140.0
+        )
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     if arguments.operation == "stop":
@@ -301,6 +317,7 @@ def _exec_bridge(arguments: argparse.Namespace) -> int:
         host=arguments.host,
         control_path=arguments.control_path,
         ssh_binary=arguments.ssh,
+        max_sessions=arguments.max_sessions,
     )
     return run_bridge(
         settings,
