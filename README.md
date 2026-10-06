@@ -121,11 +121,11 @@ return replayed=true or fail"]
 
 Exit code 255 is evidence, not a verdict. Pazuzu first checks whether the same
 master can still open a real session. It replaces the connection when that
-probe is refused or the master stops answering, and replays only when the
-caller declared the operation safe. A probe that is merely slow while the master
-still answers points at a busy remote host rather than a broken connection, so
-it is counted instead: the connection is replaced only after three consecutive
-slow probes.
+probe fails or the master stops answering, and replays only when the caller
+declared the operation safe. A probe that is merely slow, or that the server
+refuses for lack of sessions, while the master still answers points at a busy
+remote host rather than a broken connection, so it is counted instead: the
+connection is replaced only after three consecutive such probes.
 Authentication failures leave the local gateway available but pause automatic
 attempts until the user reauthorizes and requests `pazuzu reconnect`.
 
@@ -174,6 +174,14 @@ ControlMaster instead of reconnecting. Remove both services with
 `pazuzu service uninstall`; `pazuzu stop` alone is intentionally restarted by
 launchd while the service remains installed.
 
+The gateway and MCP adapter run as standard, not background, LaunchAgents. macOS
+marks every socket a background job opens as background traffic and gives it
+LEDBAT, a scavenger congestion controller that throttles the shared SSH
+connection to a fraction of a long-distance link. An adopted master keeps the
+policy of the gateway that started it, so after upgrading from a release that
+installed background agents, run `pazuzu service install` again and then
+`pazuzu reconnect --force` once.
+
 The default local socket and private ControlMaster live below
 `~/Library/Caches/pazuzu/` on macOS and `~/.cache/pazuzu/` elsewhere. Override
 them with `--socket` and `--control-path` when running multiple gateways.
@@ -189,8 +197,9 @@ python3 inspect.py | pazuzu exec -- python3 -
 
 ### File transfer
 
-Copy and synchronize files through the gateway-owned ControlMaster. Transfers
-run under the gateway's session budget and have a bounded local deadline:
+Copy and synchronize files through the gateway-owned ControlMaster. Each
+transfer runs on its own channel within the gateway's session budget, alongside
+commands and other transfers, and has a bounded local deadline:
 
 ```bash
 # Upload and download one file. Use normal scp flags after `--`.
@@ -211,17 +220,16 @@ unambiguously local.
 
 The gateway owns the native `scp` or `rsync` process, bounds its output, and
 terminates the whole process group on cancellation or timeout (600 seconds by
-default; override with `--timeout`). It never replays a transfer after a
+default; override with `--timeout`; time spent waiting for a free session
+counts). It never replays a transfer after a
 disconnect because the destination may have been partially changed. Native
 exit codes are preserved; use rsync's `--partial` or other application-level
 recovery options when resumability is required.
 
-Pazuzu reserves one transient ControlMaster session for gateway operations and
-health probes, and serializes those users so a probe cannot overlap a transfer
-under a constrained remote `MaxSessions`. One additional session is left for
-the explicitly interactive `pazuzu shell` attachment, whose terminal bytes
-remain outside the gateway. Long-lived service bridges acquire their own
-crash-safe leases and cannot consume the transient or shell-slack slots.
+Every transfer shares one encrypted TCP connection with everything else, so
+parallel transfers raise throughput only until that connection is saturated.
+Several large files usually move faster as a few concurrent `pazuzu rsync`
+invocations than one after another.
 
 ### Interactive shell
 
@@ -258,16 +266,24 @@ and make the same busy host authenticate a new connection, so a session probe
 gets 30 seconds, a slow one is rechecked after 10 seconds, and a master that
 still answers is replaced only after three consecutive slow probes. A newly
 authenticated master likewise survives a slow first session. `pazuzu status`
-reports `probe_failures` and `last_probe_seconds`; tune the policy with
+reports `last_probe`, `probe_failures`, and `last_probe_seconds`; tune the
+policy with
 `pazuzu serve --probe-timeout` and `--probe-failures`. If connection
 maintenance ever stops, the gateway exits so its service manager restarts it
 and the replacement adopts the surviving master.
 
-The gateway admits six ordinary command sessions by default and health probes
-share that same budget. This leaves headroom under the common ten-session SSH
-server limit for managed bridges, an interactive shell, and connection startup.
-Override the budget with `pazuzu serve --max-sessions` only when the remote
-server's channel policy and every persistent bridge are known.
+Commands, transfers, bridges, and health probes share a budget of eight
+sessions on the master by default, under OpenSSH's default server limit of ten;
+interactive shells use the remaining headroom. Commands and transfers run
+concurrently on independent channels, and a long transfer delays nothing except
+work queued behind a full budget. Queued work starts in arrival order, and its
+`--timeout` includes the wait. One session is reserved for health probes, so a
+busy budget never looks like a broken connection, and bridges cannot take the
+last session left for commands. `pazuzu status` reports `operations_active`
+and `operations_waiting`. Change the budget with
+`pazuzu service install --max-sessions` (or `pazuzu serve --max-sessions`) only
+when the server's `MaxSessions` is known; bridges divide whatever budget the
+running gateway publishes.
 
 When the SSH provider requires interactive reauthorization, complete that in a
 normal terminal and then bypass the remaining backoff immediately:
@@ -275,6 +291,10 @@ normal terminal and then bypass the remaining backoff immediately:
 ```bash
 pazuzu reconnect
 ```
+
+`pazuzu reconnect` keeps a connection that still opens sessions, so running
+commands, transfers, and bridges survive it. `pazuzu reconnect --force`
+replaces the connection regardless and interrupts them; nothing is replayed.
 
 Pazuzu never attempts to automate an interactive login, retain credentials, or
 encode provider-specific recovery steps. Keep those steps in site documentation.

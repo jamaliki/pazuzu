@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -47,6 +48,48 @@ class LaunchdTests(unittest.TestCase):
             },
             launchd.service_status(),
         )
+
+    @mock.patch("pazuzu.launchd._install", side_effect=lambda label, content: content)
+    @mock.patch("pazuzu.launchd._executable", side_effect=lambda name: Path("/bin") / name)
+    def test_gateway_and_mcp_are_not_background_jobs(
+        self, _executable: mock.Mock, _install: mock.Mock
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as state,
+            mock.patch("pazuzu.launchd.default_state_dir", return_value=Path(state)),
+            mock.patch("pazuzu.launchd.sys.platform", "darwin"),
+        ):
+            gateway, mcp = launchd.install_services("example-host", mcp_port=8767, max_sessions=10)
+
+        # Background jobs get LEDBAT congestion control on every socket.
+        self.assertEqual("Standard", gateway["ProcessType"])
+        self.assertEqual("Standard", mcp["ProcessType"])
+        arguments = gateway["ProgramArguments"]
+        self.assertEqual("10", arguments[arguments.index("--max-sessions") + 1])
+
+    @mock.patch("pazuzu.launchd._install", side_effect=lambda label, content: content)
+    @mock.patch("pazuzu.launchd._executable", side_effect=lambda name: Path("/bin") / name)
+    def test_bridge_uses_the_installed_gateway_host_in_the_background(
+        self, _executable: mock.Mock, _install: mock.Mock
+    ) -> None:
+        gateway = ["/bin/pazuzu", "serve", "--host", "example-host"]
+        with (
+            tempfile.TemporaryDirectory() as state,
+            mock.patch("pazuzu.launchd.default_state_dir", return_value=Path(state)),
+            mock.patch("pazuzu.launchd._program_arguments", return_value=gateway),
+        ):
+            bridge = launchd.install_bridge(
+                "queue",
+                ["/remote/bin/server"],
+                listen_host="127.0.0.1",
+                listen_port=8766,
+                remote_host="127.0.0.1",
+                remote_port=18766,
+            )
+
+        arguments = bridge["ProgramArguments"]
+        self.assertEqual("example-host", arguments[arguments.index("--host") + 1])
+        self.assertEqual("Background", bridge["ProcessType"])
 
 
 if __name__ == "__main__":

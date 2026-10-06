@@ -17,10 +17,15 @@ from pathlib import Path
 from typing import Any
 
 from .errors import CommandTimedOut, ConnectionUnavailable
-from .lease import SessionLeasePool, session_lease_directory
+from .lease import SessionBudget
 from .process import ProcessResult, run_process
 
-DEFAULT_MAX_SESSIONS = 6
+# OpenSSH servers default to MaxSessions 10.  Eight leaves room for two
+# interactive shells, which attach outside Pazuzu's budget.
+DEFAULT_MAX_SESSIONS = 8
+# The master's reply when the server, or a proxy in front of it, declines to
+# open another channel.  The connection answered, so the master is alive.
+SESSION_REFUSED = b"Session open refused by peer"
 
 
 def _spawn_master(argv: list[str], log_handle: Any) -> subprocess.Popen[bytes]:
@@ -170,8 +175,8 @@ class SshSettings:
     def validate(self) -> None:
         if not self.host:
             raise ValueError("SSH host must not be empty")
-        if not 1 <= self.max_sessions <= 64:
-            raise ValueError("max_sessions must be between 1 and 64")
+        if not 2 <= self.max_sessions <= 64:
+            raise ValueError("max_sessions must be between 2 and 64")
         if not 1 <= self.connection_attempts <= 5:
             raise ValueError("connection_attempts must be between 1 and 5")
         if not 1 <= self.probe_failures <= 10:
@@ -192,16 +197,7 @@ class OpenSshTransport:
         self._master_log: Any | None = None
         self._master_log_path: Path | None = None
         self._start_count = 0
-        # Leave one slot for a transient gateway operation and one for an
-        # interactive shell attachment outside the gateway.  Bridges consume
-        # only the remaining slots, so remote MaxSessions pressure cannot make
-        # health and a transfer compete with one another.
-        self.session_leases = SessionLeasePool(
-            session_lease_directory(settings.control_path),
-            1,
-            start_slot=max(0, settings.max_sessions - 3),
-        )
-        self.health_leases = self.session_leases
+        self.budget = SessionBudget(settings.control_path, settings.max_sessions)
 
     async def start_master(self) -> None:
         control_path = self.settings.control_path
@@ -299,11 +295,7 @@ class OpenSshTransport:
 
         if not await self.control_check():
             return False
-        try:
-            probe = await self.session("true", timeout=self.settings.probe_timeout)
-        except CommandTimedOut:
-            return False
-        return probe.exit_code == 0
+        return await self._probe_until_settled() == "ok"
 
     async def control_check(self) -> bool:
         """Check local master-process liveness without opening a connection."""
@@ -313,11 +305,45 @@ class OpenSshTransport:
         result = await self._control_command("check")
         return result.exit_code == 0
 
-    async def probe(self) -> bool:
-        """Prove the existing master can open a real command channel."""
+    async def probe(self) -> str:
+        """Open one real session in the reserved probe slot.
 
-        result = await self.session("true", timeout=self.settings.probe_timeout)
-        return result.exit_code == 0
+        Returns ``ok``; ``slow`` when no session opened within the probe
+        timeout; ``busy`` when the server answered but refused another channel;
+        or ``failed``.  Slow and busy are ambiguous: a busy login host and a
+        proxy whose upstream has gone both look like this, so callers decide
+        how many to tolerate.
+        """
+
+        timeout = self.settings.probe_timeout
+        try:
+            lease = await self.budget.probes().acquire_async(timeout=timeout)
+        except TimeoutError:
+            return "slow"
+        try:
+            result = await self.session("true", timeout=timeout)
+        except CommandTimedOut:
+            return "slow"
+        except ConnectionUnavailable:
+            return "failed"
+        finally:
+            lease.release()
+        if result.exit_code == 0:
+            return "ok"
+        if result.exit_code == 255 and SESSION_REFUSED in result.stderr:
+            return "busy"
+        return "failed"
+
+    async def _probe_until_settled(self) -> str:
+        """Probe a master that answers locally, tolerating a busy remote host."""
+
+        outcome = "failed"
+        for _ in range(self.settings.probe_failures):
+            self._raise_if_master_exited()
+            outcome = await self.probe()
+            if outcome not in {"slow", "busy"}:
+                break
+        return outcome
 
     async def session(
         self, command: str, *, stdin: bytes = b"", timeout: float
@@ -361,17 +387,14 @@ class OpenSshTransport:
             await asyncio.sleep(0.1)
         # The master has authenticated. A slow first session on a busy host is
         # retried instead of discarding the connection and authenticating again.
-        failure = "session probe failed"
-        for _ in range(self.settings.probe_failures):
-            self._raise_if_master_exited()
-            try:
-                if await self.probe():
-                    return
-            except CommandTimedOut as exc:
-                failure = f"session probe failed: {exc}"
-                continue
-            break
-        raise ConnectionUnavailable(self._master_error(failure))
+        outcome = await self._probe_until_settled()
+        if outcome == "ok":
+            return
+        reason = {
+            "slow": f": no session opened within {self.settings.probe_timeout:g}s",
+            "busy": ": the server refused another session",
+        }.get(outcome, "")
+        raise ConnectionUnavailable(self._master_error(f"session probe failed{reason}"))
 
     def _raise_if_master_exited(self) -> None:
         if self._master is not None and self._master.poll() is not None:
@@ -583,6 +606,10 @@ def run_bridge(
         remote_port=remote_port,
         remote_command=remote_command,
     )
+    # Bridges are long-lived clients of the master.  Each holds one session
+    # lease for its lifetime from the slots that always leave the gateway room,
+    # dividing the budget the running gateway published.
+    bridge_pool = SessionBudget.published(settings.control_path, settings.max_sessions).bridges()
 
     stop = threading.Event()
     child: subprocess.Popen[bytes] | None = None
@@ -597,13 +624,14 @@ def run_bridge(
         signum: signal.signal(signum, relay_signal)
         for signum in (signal.SIGINT, signal.SIGTERM)
     }
-    # Bridges are long-lived external clients of the master.  Hold one shared
-    # lease for their lifetime and exclude the final slot, reserved for health.
-    bridge_pool = SessionLeasePool(
-        session_lease_directory(settings.control_path), max(1, settings.max_sessions - 3)
-    )
-    bridge_lease = bridge_pool.acquire()
+    bridge_lease = None
     try:
+        while bridge_lease is None:
+            try:
+                bridge_lease = bridge_pool.acquire(timeout=1.0)
+            except TimeoutError:
+                if stop.is_set():
+                    return 0
         # A SIGKILL may have prevented a previous instance from cleaning up.
         _control_bridge(cancel_argv, required=False)
         delay = 1.0
@@ -652,13 +680,15 @@ def run_bridge(
     finally:
         if forward_registered:
             _control_bridge(cancel_argv, required=False)
-        bridge_lease.release()
+        if bridge_lease is not None:
+            bridge_lease.release()
         for signum, handler in previous.items():
             signal.signal(signum, handler)
 
 
 __all__ = [
     "DEFAULT_MAX_SESSIONS",
+    "SESSION_REFUSED",
     "OpenSshTransport",
     "ShellAttachment",
     "SshAttachment",

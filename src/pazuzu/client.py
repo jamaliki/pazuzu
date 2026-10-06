@@ -35,10 +35,15 @@ class PazuzuClient:
             self.socket_path, "status", {"probe": probe}, timeout=timeout
         )
 
-    async def reconnect(self) -> dict[str, Any]:
-        """Reconnect immediately, typically after interactive reauthorization."""
+    async def reconnect(self, *, force: bool = False) -> dict[str, Any]:
+        """Repair immediately, typically after interactive reauthorization.
 
-        return await call_gateway(self.socket_path, "reconnect", timeout=140.0)
+        A healthy master is kept unless ``force`` asks for a new connection.
+        """
+
+        return await call_gateway(
+            self.socket_path, "reconnect", {"force": force}, timeout=140.0
+        )
 
     async def run(
         self,
