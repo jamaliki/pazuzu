@@ -58,6 +58,28 @@ class SlurmTests(unittest.TestCase):
                 resources=self.resources(),
             )
 
+    def test_node_list_renders_only_when_declared(self) -> None:
+        for node_list in (None, "gpu-10", "gpu-[10-12,15]", "gpu-10,gpu-11"):
+            with self.subTest(node_list=node_list):
+                job = SlurmJob(
+                    name="node-selection",
+                    argv=("true",),
+                    cwd="/remote",
+                    log_dir="/remote/logs",
+                    resources=self.resources(node_list=node_list),
+                )
+                script = render_slurm_script(job)
+                if node_list is None:
+                    self.assertNotIn("--nodelist", script)
+                else:
+                    self.assertIn(f"#SBATCH --nodelist={node_list}\n", script)
+
+    def test_node_list_rejects_non_strings_and_injection(self) -> None:
+        for value in ("", "gpu 10", "gpu-10\n#SBATCH --exclusive", "gpu-10\x00", "gpu;true",
+                      "$(hostname)", "gpu'é", "--exclusive", False, 10):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.resources(node_list=value)
+
     def test_job_copies_mutable_inputs(self) -> None:
         argv = ["python3", "train.py"]
         environment = {"MODE": "smoke"}

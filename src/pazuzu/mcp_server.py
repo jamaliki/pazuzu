@@ -131,6 +131,7 @@ def create_server(
         array: str | None = None,
         dependency: str | None = None,
         environment: dict[str, str] | None = None,
+        node_list: str | None = None,
     ) -> dict[str, Any]:
         """Render and submit one generic Slurm job without replaying `sbatch`."""
 
@@ -147,6 +148,7 @@ def create_server(
             constraint=constraint,
             array=array,
             dependency=dependency,
+            node_list=node_list,
         )
         job = SlurmJob(
             name=name,

@@ -13,6 +13,7 @@ from typing import Any
 
 _JOB_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_NODE_LIST = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\[\],-]*\Z")
 _TERMINAL_STATES = {
     "BOOT_FAIL",
     "CANCELLED",
@@ -80,6 +81,7 @@ class SlurmResources:
     constraint: str | None = None
     array: str | None = None
     dependency: str | None = None
+    node_list: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.time_limit, str):
@@ -97,8 +99,11 @@ class SlurmResources:
             "constraint",
             "array",
             "dependency",
+            "node_list",
         ):
             _directive(name, getattr(self, name))
+        if self.node_list is not None and not _NODE_LIST.fullmatch(self.node_list):
+            raise ValueError("node_list must contain only ASCII host-list characters")
 
 
 @dataclass(frozen=True)
@@ -197,6 +202,7 @@ def render_slurm_script(job: SlurmJob) -> str:
         ("account", resources.account),
         ("qos", resources.qos),
         ("constraint", resources.constraint),
+        ("nodelist", resources.node_list),
     ):
         if value is not None:
             lines.append(f"#SBATCH --{option}={value}")

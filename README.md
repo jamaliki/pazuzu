@@ -351,6 +351,10 @@ code, truncation flags, connection generation, and whether it was replayed.
 never replays an uncertain submission. Pazuzu owns this generic lifecycle;
 higher-level tools remain responsible for workflows and application semantics.
 
+Set `SlurmResources.node_list` to a Slurm host list such as `"gpu-10"` or
+`"gpu-[10-12]"` to request specific nodes. Omitting it leaves node selection
+to Slurm.
+
 ## MCP
 
 Run the optional adapter against the same gateway:
