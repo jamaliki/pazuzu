@@ -82,6 +82,7 @@ class SlurmResources:
     array: str | None = None
     dependency: str | None = None
     node_list: str | None = None
+    exclude: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.time_limit, str):
@@ -100,10 +101,13 @@ class SlurmResources:
             "array",
             "dependency",
             "node_list",
+            "exclude",
         ):
             _directive(name, getattr(self, name))
-        if self.node_list is not None and not _NODE_LIST.fullmatch(self.node_list):
-            raise ValueError("node_list must contain only ASCII host-list characters")
+        for name in ("node_list", "exclude"):
+            value = getattr(self, name)
+            if value is not None and not _NODE_LIST.fullmatch(value):
+                raise ValueError(f"{name} must contain only ASCII host-list characters")
 
 
 @dataclass(frozen=True)
@@ -203,6 +207,7 @@ def render_slurm_script(job: SlurmJob) -> str:
         ("qos", resources.qos),
         ("constraint", resources.constraint),
         ("nodelist", resources.node_list),
+        ("exclude", resources.exclude),
     ):
         if value is not None:
             lines.append(f"#SBATCH --{option}={value}")

@@ -80,6 +80,28 @@ class SlurmTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.resources(node_list=value)
 
+    def test_exclude_renders_only_when_declared(self) -> None:
+        for exclude in (None, "gpu-5", "gpu-[5-7]", "gpu-5,gpu-9"):
+            with self.subTest(exclude=exclude):
+                job = SlurmJob(
+                    name="node-exclusion",
+                    argv=("true",),
+                    cwd="/remote",
+                    log_dir="/remote/logs",
+                    resources=self.resources(exclude=exclude),
+                )
+                script = render_slurm_script(job)
+                if exclude is None:
+                    self.assertNotIn("--exclude", script)
+                else:
+                    self.assertIn(f"#SBATCH --exclude={exclude}\n", script)
+
+    def test_exclude_rejects_non_strings_and_injection(self) -> None:
+        for value in ("", "gpu 5", "gpu-5\n#SBATCH --exclusive", "gpu-5\x00", "gpu;true",
+                      "$(hostname)", "gpu'é", "--exclusive", False, 10):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.resources(exclude=value)
+
     def test_job_copies_mutable_inputs(self) -> None:
         argv = ["python3", "train.py"]
         environment = {"MODE": "smoke"}
