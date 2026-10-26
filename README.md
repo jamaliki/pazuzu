@@ -352,8 +352,9 @@ never replays an uncertain submission. Pazuzu owns this generic lifecycle;
 higher-level tools remain responsible for workflows and application semantics.
 
 Set `SlurmResources.node_list` to a Slurm host list such as `"gpu-10"` or
-`"gpu-[10-12]"` to request specific nodes. Omitting it leaves node selection
-to Slurm.
+`"gpu-[10-12]"` to request specific nodes, and `SlurmResources.exclude` to a
+host list such as `"gpu-5"` or `"gpu-5,gpu-9"` to keep the job off named
+nodes. Omitting both leaves node selection to Slurm.
 
 ## MCP
 

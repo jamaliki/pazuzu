@@ -4,7 +4,7 @@ from .client import PazuzuClient
 from .slurm import SlurmHandle, SlurmJob, SlurmResources, SlurmStatus
 from .supervisor import CommandResult
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "CommandResult",
