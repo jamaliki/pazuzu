@@ -85,7 +85,8 @@ class McpTests(unittest.IsolatedAsyncioTestCase):
                     "cpus_per_task": 14,
                     "gpus_per_node": 1,
                     "partition": "gpu",
-                    "node_list": "gpu-10",
+                    "node_list": "gpu-[10-12]",
+                    "exclude": "gpu-11",
                 },
             )
             status = await session.call_tool("slurm_job_status", {"job_id": "12345"})
@@ -111,7 +112,8 @@ class McpTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(status.isError)
         self.assertEqual("RUNNING", status.structuredContent["state"])
         state = json.loads((self.root / "state.json").read_text())
-        self.assertIn("#SBATCH --nodelist=gpu-10\n", state["last_sbatch_script"])
+        self.assertIn("#SBATCH --nodelist=gpu-[10-12]\n", state["last_sbatch_script"])
+        self.assertIn("#SBATCH --exclude=gpu-11\n", state["last_sbatch_script"])
 
 
 if __name__ == "__main__":
